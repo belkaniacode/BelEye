@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=BelEye
+GenericName=Video Surveillance
+Comment=RTSP camera viewer
+Categories=AudioVideo;Video;
+Terminal=false
+StartupNotify=true
+StartupWMClass=BelEye
+Exec=/home/zura/Проекты/My/BelEye/.venv/bin/python /home/zura/Проекты/My/BelEye/main.py
+Icon=beleye
+Path=/home/zura/Проекты/My/BelEye

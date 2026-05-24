@@ -1,0 +1,346 @@
+from __future__ import annotations
+
+import logging
+
+from PySide6.QtCore import QMimeData, QPoint, QRect, Qt, Signal
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QDrag,
+    QFont,
+    QFontMetrics,
+    QMouseEvent,
+    QPainter,
+    QPen,
+)
+from PySide6.QtWidgets import QApplication, QFrame, QMenu, QSizePolicy, QVBoxLayout, QWidget
+
+from app.config import CameraConfig
+from app.rtsp import build_rtsp_url
+from app.secrets import get_password
+from video.ffmpeg_player import FFmpegPlayer
+
+log = logging.getLogger(__name__)
+
+
+STATUS_COLORS = {
+    "live": QColor("#22c55e"),
+    "connecting": QColor("#eab308"),
+    "down": QColor("#ef4444"),
+    "unknown": QColor("#6b7280"),
+}
+
+
+class _Overlay(QWidget):
+    """
+    Transparent overlay drawn ON TOP of the video. Renders the camera name
+    at the bottom-left with a text shadow (no background pill), and a small
+    status dot at the bottom-right. Passes all mouse events through so the
+    underlying tile still handles clicks/menus.
+    """
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WA_NoSystemBackground)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self._name = ""
+        self._status = "connecting"
+        self._hovered = False
+        self._reorder = False
+        self._drop_target = False
+
+    def set_name(self, name: str) -> None:
+        self._name = name
+        self.update()
+
+    def set_status(self, status: str) -> None:
+        self._status = status
+        self.update()
+
+    def set_hovered(self, on: bool) -> None:
+        if self._hovered == on:
+            return
+        self._hovered = on
+        self.update()
+
+    def set_reorder(self, on: bool) -> None:
+        if self._reorder == on:
+            return
+        self._reorder = on
+        if not on:
+            self._drop_target = False
+        self.update()
+
+    def set_drop_target(self, on: bool) -> None:
+        if self._drop_target == on:
+            return
+        self._drop_target = on
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+
+        # Hover/selection border — drawn FIRST so subsequent text/dot sit on top.
+        # Drawn HERE (in the topmost overlay) instead of in CameraTile so child
+        # widgets (player) can't cover it.
+        if self._drop_target:
+            # Bright dashed accent — clear visual "drop here" affordance
+            pen = QPen(QColor("#22c55e"), 3, Qt.DashLine)
+            p.setPen(pen)
+            p.drawRect(2, 2, self.width() - 5, self.height() - 5)
+            # tinted overlay
+            p.fillRect(self.rect(), QColor(34, 197, 94, 40))
+        elif self._reorder:
+            pen = QPen(QColor("#3b82f6"), 2, Qt.DashLine)
+            p.setPen(pen)
+            p.drawRect(2, 2, self.width() - 5, self.height() - 5)
+        elif self._hovered:
+            pen = QPen(QColor("#3b82f6"), 2)
+            p.setPen(pen)
+            inset = 1
+            p.drawRect(
+                inset,
+                inset,
+                self.width() - 2 * inset - 1,
+                self.height() - 2 * inset - 1,
+            )
+
+        # Drag handle (grip) in reorder mode — top-right corner
+        if self._reorder:
+            handle_w, handle_h = 30, 22
+            x = self.width() - handle_w - 6
+            y = 6
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(0, 0, 0, 170))
+            p.drawRoundedRect(x, y, handle_w, handle_h, 4, 4)
+            p.setPen(QColor("#ffffff"))
+            font = QFont()
+            font.setPointSize(11)
+            font.setBold(True)
+            p.setFont(font)
+            p.drawText(QRect(x, y, handle_w, handle_h), Qt.AlignCenter, "⠿")
+
+        if not self._name and not self._status:
+            return
+
+        # Status dot (bottom-right)
+        dot_color = STATUS_COLORS.get(self._status, STATUS_COLORS["unknown"])
+        dot_d = 10
+        margin = 8
+        dot_rect = QRect(
+            self.width() - dot_d - margin,
+            self.height() - dot_d - margin,
+            dot_d,
+            dot_d,
+        )
+        p.setPen(QPen(QColor(0, 0, 0, 180), 1))
+        p.setBrush(dot_color)
+        p.drawEllipse(dot_rect)
+
+        # Name (bottom-left) with subtle shadow for legibility on any background
+        if self._name:
+            font = QFont()
+            font.setPointSize(9)
+            font.setWeight(QFont.Medium)
+            font.setLetterSpacing(QFont.AbsoluteSpacing, 0.2)
+            p.setFont(font)
+            fm = QFontMetrics(font)
+            x = margin
+            y = self.height() - margin - fm.descent()
+            # subtle shadow (offset 1px down + soft dark)
+            p.setPen(QColor(0, 0, 0, 180))
+            p.drawText(x + 1, y + 1, self._name)
+            # body — slightly off-white for less contrast harshness
+            p.setPen(QColor("#f1f5f9"))
+            p.drawText(x, y, self._name)
+
+
+CAMERA_MIME = "application/x-beleye-camera-id"
+
+
+class CameraTile(QFrame):
+    expandRequested = Signal(str)
+    editRequested = Signal(str)
+    removeRequested = Signal(str)
+    reconnectRequested = Signal(str)
+    swapRequested = Signal(str, str)  # source_id, target_id
+
+    def __init__(self, camera: CameraConfig, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.camera = camera
+        self.setObjectName("CameraTile")
+        self.setFrameShape(QFrame.NoFrame)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        url = build_rtsp_url(camera, get_password(camera.id))
+        self.player = FFmpegPlayer(url, self)
+        self.player.streamUp.connect(lambda: self._overlay.set_status("live"))
+        self.player.streamDown.connect(lambda _r: self._overlay.set_status("down"))
+
+        self._overlay = _Overlay(self)
+        self._overlay.set_name(camera.name)
+        self._overlay.set_status("connecting")
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(self.player)
+
+        # Compatibility shim for grid_view._name_label.setText calls
+        self._name_label = _NameProxy(self._overlay)
+
+        # Hover/selection border is drawn by the topmost _Overlay so it
+        # cannot be covered by the child player widget. CameraTile itself
+        # carries only the dark background; no QSS border (would be hidden
+        # by the child widgets anyway).
+        self.setMouseTracking(True)
+        self.setStyleSheet("#CameraTile { background: #0b0d10; }")
+
+        self._reorder_mode = False
+        self._drag_start: QPoint | None = None
+
+    # Reorder / drag-drop ----------------------------------------------
+
+    def set_reorder_mode(self, on: bool) -> None:
+        if self._reorder_mode == on:
+            return
+        self._reorder_mode = on
+        self.setAcceptDrops(on)
+        self._overlay.set_reorder(on)
+        if on:
+            self.setCursor(Qt.OpenHandCursor)
+        else:
+            self.unsetCursor()
+            self._drag_start = None
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self._reorder_mode and event.button() == Qt.LeftButton:
+            self._drag_start = event.position().toPoint()
+            self.setCursor(Qt.ClosedHandCursor)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if (
+            self._reorder_mode
+            and self._drag_start is not None
+            and (event.buttons() & Qt.LeftButton)
+        ):
+            delta = (event.position().toPoint() - self._drag_start).manhattanLength()
+            if delta >= QApplication.startDragDistance():
+                self._start_drag()
+                self._drag_start = None
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self._reorder_mode:
+            self.setCursor(Qt.OpenHandCursor)
+        self._drag_start = None
+        super().mouseReleaseEvent(event)
+
+    def _start_drag(self) -> None:
+        log.info("[FIX] Drag start: camera=%s", self.camera.id)
+        drag = QDrag(self)
+        mime = QMimeData()
+        mime.setData(CAMERA_MIME, self.camera.id.encode("utf-8"))
+        drag.setMimeData(mime)
+        # Snapshot of the tile as the drag pixmap (semi-transparent)
+        pix = self.grab()
+        target_w = min(240, self.width())
+        if pix.width() > target_w:
+            pix = pix.scaledToWidth(target_w, Qt.SmoothTransformation)
+        drag.setPixmap(pix)
+        drag.setHotSpot(pix.rect().center())
+        drag.exec(Qt.MoveAction)
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802
+        if not self._reorder_mode:
+            event.ignore()
+            return
+        if event.mimeData().hasFormat(CAMERA_MIME):
+            src_id = bytes(event.mimeData().data(CAMERA_MIME)).decode("utf-8")
+            if src_id != self.camera.id:
+                event.acceptProposedAction()
+                self._overlay.set_drop_target(True)
+                return
+        event.ignore()
+
+    def dragLeaveEvent(self, event) -> None:  # noqa: N802
+        self._overlay.set_drop_target(False)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        self._overlay.set_drop_target(False)
+        if not (self._reorder_mode and event.mimeData().hasFormat(CAMERA_MIME)):
+            event.ignore()
+            return
+        src_id = bytes(event.mimeData().data(CAMERA_MIME)).decode("utf-8")
+        if src_id and src_id != self.camera.id:
+            log.info("[FIX] Drop swap: %s -> %s", src_id, self.camera.id)
+            self.swapRequested.emit(src_id, self.camera.id)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    # Public ------------------------------------------------------------
+
+    def start(self) -> None:
+        self._overlay.set_status("connecting")
+        self.player.start()
+
+    def stop(self) -> None:
+        self.player.stop()
+        self._overlay.set_status("down")
+
+    def reload_credentials(self) -> None:
+        url = build_rtsp_url(self.camera, get_password(self.camera.id))
+        was_running = self.player.is_running() or not self.player._stopped
+        self.player.stop()
+        self.player.set_url(url)
+        self._overlay.set_status("connecting")
+        if was_running:
+            self.player.start()
+
+    # Events ------------------------------------------------------------
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._overlay.setGeometry(0, 0, self.width(), self.height())
+
+    def enterEvent(self, event) -> None:  # noqa: N802
+        self._overlay.set_hovered(True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        self._overlay.set_hovered(False)
+        super().leaveEvent(event)
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            self.expandRequested.emit(self.camera.id)
+        super().mouseDoubleClickEvent(event)
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802
+        menu = QMenu(self)
+        act_edit = QAction("Изменить...", menu)
+        act_remove = QAction("Удалить", menu)
+        act_reconnect = QAction("Переподключить", menu)
+        menu.addAction(act_edit)
+        menu.addAction(act_reconnect)
+        menu.addSeparator()
+        menu.addAction(act_remove)
+        act_edit.triggered.connect(lambda: self.editRequested.emit(self.camera.id))
+        act_remove.triggered.connect(lambda: self.removeRequested.emit(self.camera.id))
+        act_reconnect.triggered.connect(lambda: self.reconnectRequested.emit(self.camera.id))
+        menu.exec(event.globalPos())
+
+
+class _NameProxy:
+    """Tiny shim so existing `_name_label.setText(...)` callers keep working."""
+
+    def __init__(self, overlay: _Overlay) -> None:
+        self._overlay = overlay
+
+    def setText(self, text: str) -> None:
+        self._overlay.set_name(text)

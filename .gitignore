@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+*.log
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# AI tooling / dev artifacts
+.ai-factory/
+.ai-factory.json
+.claude/
+.code-review-graph/
