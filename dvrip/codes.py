@@ -17,14 +17,23 @@ class MsgId(IntEnum):
     ABILITY_GET_REQ = 1360
     ABILITY_GET_RSP = 1361
 
+    # Per-channel digital status (lists camera names; empty ports read "D05"…)
+    DIGITAL_CHANNEL_STATUS_REQ = 1048
+    DIGITAL_CHANNEL_STATUS_RSP = 1049
+
     CONFIG_GET_REQ = 1042
     CONFIG_GET_RSP = 1043
 
-    MONITOR_CLAIM_REQ = 1410
-    MONITOR_CLAIM_RSP = 1411
-    MONITOR_REQ = 1412
-    MONITOR_DATA = 1413
-    MONITOR_STOP_REQ = 1414
+    # Verified against real hardware (Xiongmai NBD80S16S-KL, V4.03):
+    #   Claim REQ 1413 -> RSP 1414 (Ret=100), then Start REQ 1410,
+    #   binary video then streams in as MONITOR_DATA = 1412 packets.
+    # (The "obvious" 1410/1411/1412/1413 ordering is WRONG for this firmware
+    #  and gets the claim rejected with Ret=103.)
+    MONITOR_CLAIM_REQ = 1413
+    MONITOR_CLAIM_RSP = 1414
+    MONITOR_START_REQ = 1410
+    MONITOR_DATA = 1412
+    MONITOR_STOP_REQ = 1413  # Action "Stop" on the claim opcode
 
     PLAYBACK_CLAIM_REQ = 1420
     PLAYBACK_CLAIM_RSP = 1421

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -64,8 +65,13 @@ class DvripClient(QObject):
     # File query
     fileList = Signal(list)            # list[FileRecord]
 
-    def __init__(self, parent: QObject | None = None) -> None:
+    def __init__(self, parent: QObject | None = None, *, auto_discover: bool = True) -> None:
         super().__init__(parent)
+        # auto_discover: probe channel list right after login. The "Add NVR"
+        # form wants this; live tiles do NOT (they already know their channel,
+        # and running discovery on the same socket competes with OPMonitor and
+        # makes the firmware reject the monitor claim with Ret=103).
+        self._auto_discover = auto_discover
         self._sock = QTcpSocket(self)
         self._sock.connected.connect(self._on_connected)
         self._sock.disconnected.connect(self._on_disconnected)
@@ -83,6 +89,14 @@ class DvripClient(QObject):
         self._keepalive = QTimer(self)
         self._keepalive.setInterval(KEEPALIVE_INTERVAL_MS)
         self._keepalive.timeout.connect(self._send_keepalive)
+
+        # Channel discovery is best-effort: firmwares differ a lot, so we try
+        # several requests in sequence and accept whichever one yields a count.
+        self._discovery_pending: bool = False
+        self._discovery_queue: list[tuple[int, dict[str, Any]]] = []
+        self._discovery_timer = QTimer(self)
+        self._discovery_timer.setSingleShot(True)
+        self._discovery_timer.timeout.connect(self._next_discovery_request)
 
     # ----- public API ----------------------------------------------------
 
@@ -224,24 +238,39 @@ class DvripClient(QObject):
         log.debug("[DVRIP] send msg=%d bytes=%d written=%d", msg_id, len(wire), n)
 
     def _dispatch(self, pkt: Packet) -> None:
-        log.debug("[DVRIP] recv msg=%d len=%d", pkt.msg_id, len(pkt.payload))
+        # Streaming + keepalive are noisy; log them short. Everything else
+        # (control responses) is logged in FULL so firmware quirks are
+        # diagnosable from the log without re-running.
+        if pkt.msg_id in (MsgId.MONITOR_DATA, MsgId.PLAYBACK_DATA, MsgId.KEEPALIVE_RSP):
+            log.debug("[DVRIP] recv msg=%d len=%d", pkt.msg_id, len(pkt.payload))
+        else:
+            full = pkt.payload.rstrip(b"\x00").decode("utf-8", errors="replace")
+            log.info("[DVRIP] recv msg=%d len=%d body=%s", pkt.msg_id, len(pkt.payload), full)
+
+        # Generic: any JSON body with a channel-count-ish field counts as discovery.
+        if self._discovery_pending and pkt.msg_id != MsgId.LOGIN_RSP:
+            if self._try_discover_from_payload(pkt):
+                return
 
         if pkt.msg_id == MsgId.LOGIN_RSP:
             self._handle_login_rsp(pkt)
-        elif pkt.msg_id == MsgId.MONITOR_CLAIM_RSP:
+        elif pkt.msg_id == MsgId.MONITOR_CLAIM_RSP:  # 1414
             self._handle_monitor_claim_rsp(pkt)
-        elif pkt.msg_id == MsgId.MONITOR_DATA:
+        elif pkt.msg_id == MsgId.MONITOR_DATA:       # 1412
             self._handle_monitor_data(pkt)
         elif pkt.msg_id == MsgId.PLAYBACK_DATA:
             self.playbackChunk.emit(pkt.payload)
-        elif pkt.msg_id == MsgId.SYSINFO_RSP:
+        elif pkt.msg_id in (
+            MsgId.SYSINFO_RSP, MsgId.ABILITY_GET_RSP, MsgId.CONFIG_GET_RSP,
+            MsgId.DIGITAL_CHANNEL_STATUS_RSP,
+        ):
             self._handle_sysinfo_rsp(pkt)
         elif pkt.msg_id == MsgId.KEEPALIVE_RSP:
             log.debug("[DVRIP] keepalive ack")
         elif pkt.msg_id == MsgId.FILE_QUERY_RSP:
             self._handle_file_query_rsp(pkt)
         else:
-            log.debug("[DVRIP] unhandled msg=%d", pkt.msg_id)
+            log.info("[DVRIP] unhandled msg=%d (logged above)", pkt.msg_id)
 
     # ----- specific response handlers -----------------------------------
 
@@ -258,37 +287,86 @@ class DvripClient(QObject):
             self._keepalive.start()
             log.info("[DVRIP] login ok session=0x%08x", self._session_id)
             self.loginOk.emit(self._session_id)
-            # kick off channel discovery right away
-            self._send(MsgId.SYSINFO_REQ, {"Name": "SystemInfo", "SessionID": self._sid_str()})
+            if self._auto_discover:
+                self._start_channel_discovery()
         else:
             reason = f"login failed (Ret={ret})"
             log.warning("[DVRIP] %s payload=%s", reason, body)
             self.loginFailed.emit(reason)
 
     def _handle_sysinfo_rsp(self, pkt: Packet) -> None:
-        body = _parse_json(pkt.payload)
-        info = body.get("SystemInfo", {})
-        n_channels = int(info.get("VideoInChannel", 0) or 0)
-        if n_channels <= 0:
-            # Some firmwares report ChannelNum at the top level instead.
-            n_channels = int(body.get("ChannelNum", 0) or 0)
-        if n_channels <= 0:
-            log.warning("[NVR] SystemInfo returned 0 channels: %s", body)
+        self._try_discover_from_payload(pkt)
+
+    # ----- channel discovery (firmware-tolerant) ------------------------
+
+    _CHANNEL_FIELDS = (
+        "VideoInChannel", "DigChannel", "ChannelNum", "ChannelCount",
+        "VideoInputChannels", "ChannelTitle",
+    )
+
+    def _start_channel_discovery(self) -> None:
+        sid = self._sid_str()
+        # Ordered list of (msg_id, body) to try until one yields a channel count.
+        self._discovery_queue = [
+            # Preferred: lists per-channel status; empty digital ports read
+            # as the default "D05".."D08" placeholder, so we can show only
+            # the channels that actually have a camera.
+            (MsgId.DIGITAL_CHANNEL_STATUS_REQ,
+                {"Name": "OPMonitor.DigitalChannelStatus", "SessionID": sid}),
+            (MsgId.SYSINFO_REQ,    {"Name": "SystemInfo", "SessionID": sid}),
+            (MsgId.CONFIG_GET_REQ, {"Name": "SystemInfo", "SessionID": sid}),
+            (MsgId.CONFIG_GET_REQ, {"Name": "OPMachine",  "SessionID": sid}),
+            (MsgId.ABILITY_GET_REQ,{"Name": "SystemFunction", "SessionID": sid}),
+            (MsgId.CONFIG_GET_REQ, {"Name": "ChannelTitle", "SessionID": sid}),
+        ]
+        self._discovery_pending = True
+        self._next_discovery_request()
+
+    def _next_discovery_request(self) -> None:
+        if not self._discovery_pending:
             return
-        channels = [Channel(number=i + 1, name=f"CH{i + 1:02d}") for i in range(n_channels)]
-        log.info("[NVR] discovered %d channels", n_channels)
+        if not self._discovery_queue:
+            log.warning("[NVR] discovery exhausted: no firmware-specific request returned channels")
+            self._discovery_pending = False
+            # As a last resort, ask the user-facing layer to retry by emitting
+            # an empty list — the form treats empty as failure.
+            self.channelsDiscovered.emit([])
+            return
+        msg_id, body = self._discovery_queue.pop(0)
+        log.info("[NVR] discovery try msg=%d body=%s", msg_id, body)
+        self._send(msg_id, body)
+        # Give the NVR ~2.5 s, then move on to the next strategy.
+        self._discovery_timer.start(2500)
+
+    def _try_discover_from_payload(self, pkt: Packet) -> bool:
+        body = _parse_json(pkt.payload)
+        if not body:
+            return False
+        active = _extract_active_channels(body)
+        if not active:
+            return False
+        channels = [Channel(number=num, name=name) for num, name in active]
+        log.info(
+            "[NVR] discovered %d active channels via msg=%d: %s",
+            len(channels), pkt.msg_id,
+            ", ".join(f"ch{num}={name!r}" for num, name in active),
+        )
+        self._discovery_pending = False
+        self._discovery_timer.stop()
+        self._discovery_queue.clear()
         self.channelsDiscovered.emit(channels)
+        return True
 
     def _handle_monitor_claim_rsp(self, pkt: Packet) -> None:
         body = _parse_json(pkt.payload)
         ret = int(body.get("Ret", -1))
         if ret != 100:
-            log.warning("[NVR] monitor claim rejected Ret=%d", ret)
+            log.warning("[NVR] monitor claim rejected Ret=%d full=%s", ret, body)
             return
         # Now send the actual Start request to begin the data stream.
         for pending in list(self._pending_monitors.values()):
             self._send(
-                MsgId.MONITOR_REQ,
+                MsgId.MONITOR_START_REQ,
                 {
                     "Name": "OPMonitor",
                     "SessionID": self._sid_str(),
@@ -335,6 +413,109 @@ class FileRecord:
     size: int = 0
     disk: int = 0
     extra: dict[str, Any] = field(default_factory=dict)
+
+
+def _extract_channel_count(body: dict[str, Any]) -> int:
+    """Walk the response dict looking for the real number of configured channels.
+
+    Order of preference:
+      1. ChannelTitle with non-empty names — that's how many channels the
+         user actually configured (an NVR that supports 8 but has 4 cameras
+         plugged in still lists 8 slots in VideoInChannel, but only 4 in
+         ChannelTitle with non-empty names).
+      2. ChannelTitle length (any names, including empty) — fallback.
+      3. Numeric fields VideoInChannel / DigChannel / ChannelNum / ChannelCount
+         / VideoInputChannels — last resort.
+    """
+    numeric_fields = (
+        "VideoInChannel", "DigChannel", "ChannelNum", "ChannelCount",
+        "VideoInputChannels",
+    )
+
+    # First pass: look for a ChannelTitle array and count non-empty entries.
+    titles = _find_channel_titles(body)
+    if titles is not None:
+        non_empty = sum(1 for t in titles if str(t).strip())
+        if non_empty > 0:
+            return non_empty
+        if titles:  # all empty but the array is there — fall back to length
+            return len(titles)
+
+    # Second pass: numeric field hints.
+    def walk(obj: Any) -> int:
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if key in numeric_fields:
+                    try:
+                        n = int(value)
+                        if 0 < n <= 64:
+                            return n
+                    except (TypeError, ValueError):
+                        pass
+                got = walk(value)
+                if got:
+                    return got
+        elif isinstance(obj, list):
+            for item in obj:
+                got = walk(item)
+                if got:
+                    return got
+        return 0
+
+    return walk(body)
+
+
+def _find_channel_titles(body: Any) -> list[str] | None:
+    if isinstance(body, dict):
+        for key, value in body.items():
+            if key == "ChannelTitle" and isinstance(value, list):
+                return [str(x) for x in value]
+            got = _find_channel_titles(value)
+            if got is not None:
+                return got
+    elif isinstance(body, list):
+        for item in body:
+            got = _find_channel_titles(item)
+            if got is not None:
+                return got
+    return None
+
+
+_DEFAULT_DIGITAL_NAME = re.compile(r"^D0*\d+$")  # "D05", "D5", "D08"… = empty port
+
+
+def _extract_active_channels(body: dict[str, Any]) -> list[tuple[int, str]]:
+    """Return [(channel_number, name), ...] for channels that actually have a
+    camera.
+
+    Preferred source: ``OPMonitor.DigitalChannelStatus`` — an array of
+    per-channel names where an *unconnected* digital port reads as the default
+    placeholder ``D05`` / ``D08``. Channels with any other name are live.
+
+    Fallbacks: non-empty ``ChannelTitle[]`` entries, then a numeric channel
+    count with synthesized names.
+    """
+    status = body.get("OPMonitor.DigitalChannelStatus")
+    if isinstance(status, list) and status:
+        active = [
+            (i + 1, str(name))
+            for i, name in enumerate(status)
+            if str(name).strip() and not _DEFAULT_DIGITAL_NAME.match(str(name).strip())
+        ]
+        if active:
+            return active
+        # Everything looked like a placeholder — fall through to other hints.
+
+    titles = _find_channel_titles(body)
+    if titles is not None:
+        active = [(i + 1, t.strip()) for i, t in enumerate(titles) if str(t).strip()]
+        if active:
+            return active
+        # All empty but the array exists — synthesize for its length
+        if titles:
+            return [(i + 1, f"CH{i + 1:02d}") for i in range(len(titles))]
+    n = _extract_channel_count(body)
+    return [(i + 1, f"CH{i + 1:02d}") for i in range(n)]
 
 
 def _parse_json(payload: bytes) -> dict[str, Any]:

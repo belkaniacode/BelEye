@@ -23,5 +23,9 @@ def cameras_file() -> Path:
     return config_dir() / "cameras.json"
 
 
+def nvrs_file() -> Path:
+    return config_dir() / "nvrs.json"
+
+
 def log_file() -> Path:
     return log_dir() / "beleye.log"

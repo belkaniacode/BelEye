@@ -20,6 +20,9 @@ from PySide6.QtWidgets import (
 )
 
 from app import config as cfg
+from app import nvr_config as nvrcfg
+from app import secrets as keystore
+from app.nvr_config import nvr_keyring_user
 from .grid_view import GridView
 from .settings_dialog import SettingsDialog
 
@@ -116,6 +119,8 @@ class MainWindow(QMainWindow):
         if icon_path.exists():
             from PySide6.QtGui import QIcon
             self.setWindowIcon(QIcon(str(icon_path)))
+
+        self._nvr_refreshers: dict = {}
 
         self.grid = GridView(self)
         self.grid.editRequested.connect(self._on_edit_camera)
@@ -285,7 +290,65 @@ class MainWindow(QMainWindow):
     def _reload_cameras(self) -> None:
         cameras = cfg.load_cameras()
         self.grid.set_cameras(cameras)
-        self.statusBar().showMessage(f"Загружено камер: {len(cameras)}", 3000)
+        self._rebuild_nvr_tiles()
+        # Reconcile saved channels with the device's actual active channels
+        # in the background, so the grid self-heals when cameras are added or
+        # removed on the NVR without the user re-probing.
+        for nvr in nvrcfg.load_nvrs():
+            self._refresh_nvr_channels(nvr)
+
+    def _rebuild_nvr_tiles(self) -> None:
+        cameras = cfg.load_cameras()
+        nvrs = nvrcfg.load_nvrs()
+        items = []
+        total = 0
+        for nvr in nvrs:
+            password = keystore.get_password(nvr_keyring_user(nvr.id))
+            for ch in nvr.channels:
+                if ch.enabled:
+                    items.append((nvr, ch, password))
+                    total += 1
+        self.grid.set_nvr_channels(items)
+        if nvrs:
+            self.statusBar().showMessage(
+                f"Загружено: камер {len(cameras)}, NVR {len(nvrs)} ({total} каналов)", 3000)
+        else:
+            self.statusBar().showMessage(f"Загружено камер: {len(cameras)}", 3000)
+
+    def _refresh_nvr_channels(self, nvr) -> None:
+        from dvrip.client import DvripClient
+
+        password = keystore.get_password(nvr_keyring_user(nvr.id))
+        client = DvripClient(self, auto_discover=True)
+        self._nvr_refreshers[nvr.id] = client
+
+        def on_discovered(channels: list) -> None:
+            active = [(int(c.number), str(c.name)) for c in channels]
+            saved = [(c.number, c.name) for c in nvr.channels if c.enabled]
+            if active and active != saved:
+                log.info("[NVR] %s channels changed %s -> %s", nvr.name, saved, active)
+                nvr.channels = [
+                    nvrcfg.NvrChannel(number=num, name=name, enabled=True)
+                    for num, name in active
+                ]
+                nvrs = nvrcfg.load_nvrs()
+                nvrcfg.update_nvr(nvrs, nvr)
+                self._rebuild_nvr_tiles()
+            self._dispose_refresher(nvr.id)
+
+        client.channelsDiscovered.connect(on_discovered)
+        client.loginFailed.connect(lambda _r: self._dispose_refresher(nvr.id))
+        client.error.connect(lambda _e: self._dispose_refresher(nvr.id))
+        client.connect_to(nvr.host, nvr.port, nvr.username, password)
+
+    def _dispose_refresher(self, nvr_id: str) -> None:
+        client = self._nvr_refreshers.pop(nvr_id, None)
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                log.exception("[NVR] refresher close failed")
+            client.deleteLater()
 
     def _open_settings(self) -> None:
         if self.grid.is_reorder_mode():

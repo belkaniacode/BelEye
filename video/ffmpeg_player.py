@@ -72,9 +72,18 @@ class FFmpegPlayer(QWidget):
     BACKOFF_STEPS_MS = [3000, 5000, 8000, 15000, 30000]
     READY_TIMEOUT_MS = 12000  # max wait for dimensions before giving up
 
-    def __init__(self, url: str, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        url: str = "",
+        parent: QWidget | None = None,
+        *,
+        input_mode: str = "rtsp",
+        input_codec: str = "h264",
+    ) -> None:
         super().__init__(parent)
         self._url = url
+        self._input_mode = input_mode  # "rtsp" or "pipe"
+        self._input_codec = input_codec  # for pipe mode: "h264" | "hevc"
 
         self._stopped = True
         self._backoff_idx = 0
@@ -113,6 +122,10 @@ class FFmpegPlayer(QWidget):
     def set_url(self, url: str) -> None:
         self._url = url
 
+    def set_input_codec(self, codec: str) -> None:
+        """Set 'h264' or 'hevc' for pipe mode. Must be called before start()."""
+        self._input_codec = codec
+
     def start(self) -> None:
         if not self._stopped:
             return
@@ -134,6 +147,19 @@ class FFmpegPlayer(QWidget):
 
     def is_running(self) -> bool:
         return self._proc is not None and self._proc.state() != QProcess.NotRunning
+
+    def feed_bytes(self, data: bytes) -> None:
+        """Feed elementary-stream bytes to ffmpeg's stdin. Pipe mode only."""
+        if self._input_mode != "pipe":
+            return
+        if not data:
+            return
+        if self._proc is None or self._proc.state() != QProcess.Running:
+            return
+        try:
+            self._proc.write(QByteArray(data))
+        except Exception:
+            log.exception("[player] feed_bytes failed")
 
     # Process management ------------------------------------------------
 
@@ -159,21 +185,36 @@ class FFmpegPlayer(QWidget):
         self._frame_size = 0
         self._first_frame_seen = False
 
-        args = [
-            "-hide_banner",
-            "-loglevel", "info",
-            "-rtsp_transport", "tcp",
-            "-timeout", "5000000",
-            "-fflags", "nobuffer",
-            "-flags", "low_delay",
-            "-an", "-sn",
-            "-i", self._url,
-            "-an", "-sn",
-            "-vf", "scale='min(960,iw)':-2,fps=20",
-            "-f", "rawvideo",
-            "-pix_fmt", "bgr24",
-            "-",
-        ]
+        if self._input_mode == "pipe":
+            args = [
+                "-hide_banner",
+                "-loglevel", "info",
+                "-fflags", "nobuffer",
+                "-flags", "low_delay",
+                "-f", self._input_codec,
+                "-i", "pipe:0",
+                "-an", "-sn",
+                "-vf", "scale='min(960,iw)':-2,fps=20",
+                "-f", "rawvideo",
+                "-pix_fmt", "bgr24",
+                "pipe:1",
+            ]
+        else:
+            args = [
+                "-hide_banner",
+                "-loglevel", "info",
+                "-rtsp_transport", "tcp",
+                "-timeout", "5000000",
+                "-fflags", "nobuffer",
+                "-flags", "low_delay",
+                "-an", "-sn",
+                "-i", self._url,
+                "-an", "-sn",
+                "-vf", "scale='min(960,iw)':-2,fps=20",
+                "-f", "rawvideo",
+                "-pix_fmt", "bgr24",
+                "-",
+            ]
 
         proc = QProcess(self)
         proc.setProcessChannelMode(QProcess.SeparateChannels)

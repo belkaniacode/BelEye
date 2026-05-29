@@ -8,7 +8,9 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QGridLayout, QLabel, QStackedLayout, QWidget
 
 from app.config import CameraConfig
+from app.nvr_config import NvrConfig
 from .camera_widget import CameraTile
+from .nvr_channel_widget import NvrChannelTile, nvr_tile_id
 
 log = logging.getLogger(__name__)
 
@@ -25,7 +27,10 @@ class GridView(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._tiles: dict[str, CameraTile] = {}
+        # Heterogeneous: CameraTile for RTSP, NvrChannelTile for NVR channels.
+        # Both expose the same minimal interface used here (start/stop, signals,
+        # set_reorder_mode). NVR tile ids are namespaced ("nvr:<id>:ch<n>").
+        self._tiles: dict[str, "CameraTile | NvrChannelTile"] = {}
         self._mode = self.MODE_GRID
         self._focused: Optional[str] = None
         self._reorder_mode = False
@@ -59,11 +64,16 @@ class GridView(QWidget):
         [FIX] Diff-update: keep tiles whose URL is unchanged, only stop/recreate
         modified ones, and remove deleted ones. Avoids the "freeze everything,
         rebuild everything" behavior that hung the UI on every settings save.
+
+        Touches only RTSP CameraTile entries; NVR tiles are managed separately
+        by ``set_nvr_channels`` and survive this call untouched.
         """
         new_ids = {c.id for c in cameras}
 
-        # Remove tiles for deleted cameras
+        # Remove tiles for deleted RTSP cameras (skip NVR tiles).
         for cam_id in list(self._tiles.keys()):
+            if cam_id.startswith("nvr:"):
+                continue
             if cam_id not in new_ids:
                 tile = self._tiles.pop(cam_id)
                 tile.stop()
@@ -96,6 +106,56 @@ class GridView(QWidget):
                     existing._current_url = new_url
                     existing.reload_credentials()
 
+        self._relayout()
+
+    def set_nvr_channels(
+        self,
+        items: list[tuple["NvrConfig", "object", str]],
+    ) -> None:
+        """Sync NVR-channel tiles. ``items`` is a list of (nvr, channel, password).
+
+        Diff-based: only restarts a tile if its (nvr_id, channel_no) is new or
+        its connection params changed. NVR tiles are keyed under ``nvr:...``;
+        ``set_cameras`` ignores those keys.
+        """
+        desired_ids = {nvr_tile_id(nvr.id, ch.number) for nvr, ch, _ in items}
+
+        # Remove NVR tiles that are no longer wanted (channel disabled / NVR
+        # deleted / replaced by a new id).
+        for tile_id in list(self._tiles.keys()):
+            if not tile_id.startswith("nvr:"):
+                continue
+            if tile_id not in desired_ids:
+                tile = self._tiles.pop(tile_id)
+                tile.stop()
+                tile.setParent(None)
+                tile.deleteLater()
+
+        for nvr, channel, password in items:
+            tid = nvr_tile_id(nvr.id, channel.number)
+            existing = self._tiles.get(tid)
+            if existing is None:
+                tile = NvrChannelTile(nvr, channel, password, self)
+                tile.expandRequested.connect(self._on_expand)
+                tile.editRequested.connect(self.editRequested)
+                tile.removeRequested.connect(self.removeRequested)
+                tile.reconnectRequested.connect(self._on_reconnect)
+                self._tiles[tid] = tile
+                tile.start()
+            else:
+                # If host/port/user/channel name changed, restart.
+                changed = (
+                    existing.nvr.host != nvr.host
+                    or existing.nvr.port != nvr.port
+                    or existing.nvr.username != nvr.username
+                    or existing._password != password
+                )
+                existing.nvr = nvr
+                existing.channel = channel
+                existing._password = password
+                existing._overlay.set_name(f"{nvr.name} · {channel.name}")
+                if changed:
+                    existing.reload_credentials()
         self._relayout()
 
     def show_grid(self) -> None:
