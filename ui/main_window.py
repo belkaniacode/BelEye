@@ -323,16 +323,34 @@ class MainWindow(QMainWindow):
         self._nvr_refreshers[nvr.id] = client
 
         def on_discovered(channels: list) -> None:
-            active = [(int(c.number), str(c.name)) for c in channels]
-            saved = [(c.number, c.name) for c in nvr.channels if c.enabled]
-            if active and active != saved:
-                log.info("[NVR] %s channels changed %s -> %s", nvr.name, saved, active)
-                nvr.channels = [
-                    nvrcfg.NvrChannel(number=num, name=name, enabled=True)
-                    for num, name in active
-                ]
+            active_map = {int(c.number): str(c.name) for c in channels}
+            if not active_map:
+                self._dispose_refresher(nvr.id)
+                return
+            # Preserve the user's existing channel order; update names, append
+            # newly-discovered channels, drop channels no longer present.
+            merged = [
+                nvrcfg.NvrChannel(number=c.number, name=active_map[c.number], enabled=True)
+                for c in nvr.channels
+                if c.number in active_map
+            ]
+            existing_nums = {c.number for c in merged}
+            for num in sorted(active_map):
+                if num not in existing_nums:
+                    merged.append(nvrcfg.NvrChannel(number=num, name=active_map[num], enabled=True))
+
+            before = [(c.number, c.name) for c in nvr.channels]
+            after = [(c.number, c.name) for c in merged]
+            if after != before:
+                log.info("[NVR] %s channels changed %s -> %s", nvr.name, before, after)
+                nvr.channels = merged
                 nvrs = nvrcfg.load_nvrs()
-                nvrcfg.update_nvr(nvrs, nvr)
+                # update_nvr matches by id; mutate the loaded copy's channels
+                for saved_nvr in nvrs:
+                    if saved_nvr.id == nvr.id:
+                        saved_nvr.channels = merged
+                        break
+                nvrcfg.save_nvrs(nvrs)
                 self._rebuild_nvr_tiles()
             self._dispose_refresher(nvr.id)
 
@@ -416,15 +434,40 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Изменения порядка отменены", 3000)
 
     def _on_order_changed(self, new_order: list[str]) -> None:
-        """Persist new camera order to JSON."""
+        """Persist the new tile order. The list mixes RTSP camera ids and NVR
+        tile ids ("nvr:<id>:ch<n>"); split and persist each to its own file."""
+        # --- RTSP cameras ---
         cameras = cfg.load_cameras()
         by_id = {c.id: c for c in cameras}
-        # Build reordered list following new_order; append unknown ones at the end
-        reordered = [by_id[cid] for cid in new_order if cid in by_id]
-        for c in cameras:
-            if c.id not in new_order:
-                reordered.append(c)
-        cfg.save_cameras(reordered)
+        cam_order = [cid for cid in new_order if cid in by_id]
+        if cam_order:
+            reordered = [by_id[cid] for cid in cam_order]
+            reordered += [c for c in cameras if c.id not in by_id or c.id not in cam_order]
+            # de-dup while preserving order
+            seen = set()
+            uniq = []
+            for c in reordered:
+                if c.id not in seen:
+                    seen.add(c.id)
+                    uniq.append(c)
+            cfg.save_cameras(uniq)
+
+        # --- NVR channels: reorder each NVR's channel list ---
+        nvrs = nvrcfg.load_nvrs()
+        changed = False
+        for nvr in nvrs:
+            prefix = f"nvr:{nvr.id}:ch"
+            wanted = [int(tid[len(prefix):]) for tid in new_order if tid.startswith(prefix)]
+            if not wanted:
+                continue
+            by_num = {c.number: c for c in nvr.channels}
+            new_channels = [by_num[num] for num in wanted if num in by_num]
+            new_channels += [c for c in nvr.channels if c.number not in wanted]
+            if [c.number for c in new_channels] != [c.number for c in nvr.channels]:
+                nvr.channels = new_channels
+                changed = True
+        if changed:
+            nvrcfg.save_nvrs(nvrs)
 
     # Misc --------------------------------------------------------------
 

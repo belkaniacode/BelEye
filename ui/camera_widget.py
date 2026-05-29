@@ -160,48 +160,19 @@ class _Overlay(QWidget):
 CAMERA_MIME = "application/x-beleye-camera-id"
 
 
-class CameraTile(QFrame):
-    expandRequested = Signal(str)
-    editRequested = Signal(str)
-    removeRequested = Signal(str)
-    reconnectRequested = Signal(str)
-    swapRequested = Signal(str, str)  # source_id, target_id
+class DraggableTileMixin:
+    """Drag-and-drop reordering shared by RTSP and NVR tiles.
 
-    def __init__(self, camera: CameraConfig, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.camera = camera
-        self.setObjectName("CameraTile")
-        self.setFrameShape(QFrame.NoFrame)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+    Host widget must provide:
+      - ``self._overlay`` (an _Overlay) for the reorder/drop visuals,
+      - ``self.swapRequested`` signal (str src_id, str dst_id),
+      - ``self.drag_id`` property returning this tile's grid key.
+    The grid keys it against ``GridView._tiles`` so swap works uniformly.
+    """
 
-        url = build_rtsp_url(camera, get_password(camera.id))
-        self.player = FFmpegPlayer(url, self)
-        self.player.streamUp.connect(lambda: self._overlay.set_status("live"))
-        self.player.streamDown.connect(lambda _r: self._overlay.set_status("down"))
-
-        self._overlay = _Overlay(self)
-        self._overlay.set_name(camera.name)
-        self._overlay.set_status("connecting")
-
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
-        root.addWidget(self.player)
-
-        # Compatibility shim for grid_view._name_label.setText calls
-        self._name_label = _NameProxy(self._overlay)
-
-        # Hover/selection border is drawn by the topmost _Overlay so it
-        # cannot be covered by the child player widget. CameraTile itself
-        # carries only the dark background; no QSS border (would be hidden
-        # by the child widgets anyway).
-        self.setMouseTracking(True)
-        self.setStyleSheet("#CameraTile { background: #0b0d10; }")
-
+    def _init_drag(self) -> None:
         self._reorder_mode = False
         self._drag_start: QPoint | None = None
-
-    # Reorder / drag-drop ----------------------------------------------
 
     def set_reorder_mode(self, on: bool) -> None:
         if self._reorder_mode == on:
@@ -240,12 +211,11 @@ class CameraTile(QFrame):
         super().mouseReleaseEvent(event)
 
     def _start_drag(self) -> None:
-        log.info("[FIX] Drag start: camera=%s", self.camera.id)
+        log.info("[FIX] Drag start: tile=%s", self.drag_id)
         drag = QDrag(self)
         mime = QMimeData()
-        mime.setData(CAMERA_MIME, self.camera.id.encode("utf-8"))
+        mime.setData(CAMERA_MIME, self.drag_id.encode("utf-8"))
         drag.setMimeData(mime)
-        # Snapshot of the tile as the drag pixmap (semi-transparent)
         pix = self.grab()
         target_w = min(240, self.width())
         if pix.width() > target_w:
@@ -260,7 +230,7 @@ class CameraTile(QFrame):
             return
         if event.mimeData().hasFormat(CAMERA_MIME):
             src_id = bytes(event.mimeData().data(CAMERA_MIME)).decode("utf-8")
-            if src_id != self.camera.id:
+            if src_id != self.drag_id:
                 event.acceptProposedAction()
                 self._overlay.set_drop_target(True)
                 return
@@ -276,12 +246,57 @@ class CameraTile(QFrame):
             event.ignore()
             return
         src_id = bytes(event.mimeData().data(CAMERA_MIME)).decode("utf-8")
-        if src_id and src_id != self.camera.id:
-            log.info("[FIX] Drop swap: %s -> %s", src_id, self.camera.id)
-            self.swapRequested.emit(src_id, self.camera.id)
+        if src_id and src_id != self.drag_id:
+            log.info("[FIX] Drop swap: %s -> %s", src_id, self.drag_id)
+            self.swapRequested.emit(src_id, self.drag_id)
             event.acceptProposedAction()
         else:
             event.ignore()
+
+
+class CameraTile(DraggableTileMixin, QFrame):
+    expandRequested = Signal(str)
+    editRequested = Signal(str)
+    removeRequested = Signal(str)
+    reconnectRequested = Signal(str)
+    swapRequested = Signal(str, str)  # source_id, target_id
+
+    @property
+    def drag_id(self) -> str:
+        return self.camera.id
+
+    def __init__(self, camera: CameraConfig, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.camera = camera
+        self.setObjectName("CameraTile")
+        self.setFrameShape(QFrame.NoFrame)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        url = build_rtsp_url(camera, get_password(camera.id))
+        self.player = FFmpegPlayer(url, self)
+        self.player.streamUp.connect(lambda: self._overlay.set_status("live"))
+        self.player.streamDown.connect(lambda _r: self._overlay.set_status("down"))
+
+        self._overlay = _Overlay(self)
+        self._overlay.set_name(camera.name)
+        self._overlay.set_status("connecting")
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(self.player)
+
+        # Compatibility shim for grid_view._name_label.setText calls
+        self._name_label = _NameProxy(self._overlay)
+
+        # Hover/selection border is drawn by the topmost _Overlay so it
+        # cannot be covered by the child player widget. CameraTile itself
+        # carries only the dark background; no QSS border (would be hidden
+        # by the child widgets anyway).
+        self.setMouseTracking(True)
+        self.setStyleSheet("#CameraTile { background: #0b0d10; }")
+
+        self._init_drag()
 
     # Public ------------------------------------------------------------
 

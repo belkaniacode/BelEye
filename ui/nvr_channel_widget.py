@@ -13,7 +13,7 @@ from dvrip.client import DvripClient
 from dvrip.sofia_frame import SofiaFrameParser, detect_codec
 from video.ffmpeg_player import FFmpegPlayer
 
-from .camera_widget import _Overlay, _NameProxy
+from .camera_widget import _Overlay, _NameProxy, DraggableTileMixin
 
 log = logging.getLogger(__name__)
 
@@ -23,19 +23,22 @@ def nvr_tile_id(nvr_id: str, channel: int) -> str:
     return f"nvr:{nvr_id}:ch{channel}"
 
 
-class NvrChannelTile(QFrame):
+class NvrChannelTile(DraggableTileMixin, QFrame):
     """Visually identical to CameraTile, but fed via DVRIP instead of RTSP.
 
     Exposes the same signals as ``CameraTile`` so ``GridView`` can treat them
-    uniformly (expand on double-click, context menu, etc). Drag-and-drop
-    reordering is currently disabled for NVR channels to keep the wiring
-    simple — the NVR layout is driven by channel number, not user order.
+    uniformly (expand on double-click, context menu, drag-and-drop reorder).
     """
 
     expandRequested = Signal(str)
     editRequested = Signal(str)        # emitted with nvr_id (opens NVR settings)
     removeRequested = Signal(str)      # emitted with tile_id (disables this channel)
     reconnectRequested = Signal(str)   # emitted with tile_id
+    swapRequested = Signal(str, str)   # source tile_id, target tile_id
+
+    @property
+    def drag_id(self) -> str:
+        return self._tile_id
 
     def __init__(
         self,
@@ -78,6 +81,7 @@ class NvrChannelTile(QFrame):
         self._chunk_count = 0
         self._first_chunk_logged = False
         self._parser: SofiaFrameParser | None = None
+        self._init_drag()
 
     # ----- compatibility surface (so GridView can treat us like CameraTile) -----
 
@@ -87,10 +91,6 @@ class NvrChannelTile(QFrame):
         # Note: we return the NVR config, not a CameraConfig. This is only used
         # in places that read `.id` — the tile's logical id is the tile_id below.
         return self.nvr
-
-    def set_reorder_mode(self, _on: bool) -> None:
-        # No drag-and-drop on NVR tiles for now.
-        pass
 
     # ----- lifecycle ----------------------------------------------------
 

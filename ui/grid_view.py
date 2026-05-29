@@ -140,6 +140,9 @@ class GridView(QWidget):
                 tile.editRequested.connect(self.editRequested)
                 tile.removeRequested.connect(self.removeRequested)
                 tile.reconnectRequested.connect(self._on_reconnect)
+                tile.swapRequested.connect(self._on_swap)
+                if self._reorder_mode:
+                    tile.set_reorder_mode(True)
                 self._tiles[tid] = tile
                 tile.start()
             else:
