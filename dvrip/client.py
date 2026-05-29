@@ -65,6 +65,9 @@ class DvripClient(QObject):
     # File query
     fileList = Signal(list)            # list[FileRecord]
 
+    # Recording status: {channel_no(1-based) -> bool recording}
+    recordStatus = Signal(dict)
+
     def __init__(self, parent: QObject | None = None, *, auto_discover: bool = True) -> None:
         super().__init__(parent)
         # auto_discover: probe channel list right after login. The "Add NVR"
@@ -140,6 +143,18 @@ class DvripClient(QObject):
                 },
             },
         )
+
+    def query_record_status(self) -> None:
+        """Request the per-channel record schedule. Emits ``recordStatus``.
+
+        Uses CONFIG_GET (1042) Name="Record". A channel is considered
+        recording when the first word of its schedule Mask is non-zero.
+        """
+        if not self._logged_in:
+            log.warning("[REC] query_record_status before login")
+            return
+        log.info("[REC] query record status")
+        self._send(MsgId.CONFIG_GET_REQ, {"Name": "Record", "SessionID": self._sid_str()})
 
     def stop_monitor(self, channel: int) -> None:
         if not self._logged_in:
@@ -247,6 +262,14 @@ class DvripClient(QObject):
             full = pkt.payload.rstrip(b"\x00").decode("utf-8", errors="replace")
             log.info("[DVRIP] recv msg=%d len=%d body=%s", pkt.msg_id, len(pkt.payload), full)
 
+        # Record-status response is a CONFIG_GET_RSP carrying a "Record" key.
+        # Route it by content before discovery so the two don't collide.
+        if pkt.msg_id == MsgId.CONFIG_GET_RSP:
+            body = _parse_json(pkt.payload)
+            if "Record" in body:
+                self._handle_record_status(body)
+                return
+
         # Generic: any JSON body with a channel-count-ish field counts as discovery.
         if self._discovery_pending and pkt.msg_id != MsgId.LOGIN_RSP:
             if self._try_discover_from_payload(pkt):
@@ -296,6 +319,34 @@ class DvripClient(QObject):
 
     def _handle_sysinfo_rsp(self, pkt: Packet) -> None:
         self._try_discover_from_payload(pkt)
+
+    def _handle_record_status(self, body: dict[str, Any]) -> None:
+        """Parse Record config into {channel_no -> recording bool}.
+
+        Each channel entry has a ``Mask`` (list of rows of hex words). The
+        channel is recording-enabled when any word in the mask is non-zero.
+        """
+        records = body.get("Record") or []
+        status: dict[int, bool] = {}
+        for idx, entry in enumerate(records):
+            mask = entry.get("Mask") if isinstance(entry, dict) else None
+            recording = False
+            if isinstance(mask, list):
+                for row in mask:
+                    cells = row if isinstance(row, list) else [row]
+                    for cell in cells:
+                        try:
+                            if int(str(cell), 16) != 0:
+                                recording = True
+                                break
+                        except (TypeError, ValueError):
+                            pass
+                    if recording:
+                        break
+            status[idx + 1] = recording
+        n_rec = sum(1 for v in status.values() if v)
+        log.info("[REC] record status: %d/%d channels recording", n_rec, len(status))
+        self.recordStatus.emit(status)
 
     # ----- channel discovery (firmware-tolerant) ------------------------
 

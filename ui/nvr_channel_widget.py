@@ -92,6 +92,9 @@ class NvrChannelTile(DraggableTileMixin, QFrame):
         # in places that read `.id` — the tile's logical id is the tile_id below.
         return self.nvr
 
+    def set_recording(self, on: bool) -> None:
+        self._overlay.set_recording(on)
+
     # ----- lifecycle ----------------------------------------------------
 
     def start(self) -> None:

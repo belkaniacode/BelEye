@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QSize, Qt
+from PySide6.QtCore import QByteArray, QSize, Qt, QTimer
 from PySide6.QtGui import QAction, QIcon, QKeySequence, QPainter, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
@@ -121,6 +121,12 @@ class MainWindow(QMainWindow):
             self.setWindowIcon(QIcon(str(icon_path)))
 
         self._nvr_refreshers: dict = {}
+
+        # Periodic record-status + channel refresh for NVRs (one short-lived
+        # connection per NVR per tick; kept infrequent due to low session caps).
+        self._record_timer = QTimer(self)
+        self._record_timer.setInterval(30_000)
+        self._record_timer.timeout.connect(self._poll_nvr_record_status)
 
         self.grid = GridView(self)
         self.grid.editRequested.connect(self._on_edit_camera)
@@ -293,7 +299,17 @@ class MainWindow(QMainWindow):
         self._rebuild_nvr_tiles()
         # Reconcile saved channels with the device's actual active channels
         # in the background, so the grid self-heals when cameras are added or
-        # removed on the NVR without the user re-probing.
+        # removed on the NVR without the user re-probing. The same connection
+        # also pulls record status for the REC indicator.
+        nvrs = nvrcfg.load_nvrs()
+        for nvr in nvrs:
+            self._refresh_nvr_channels(nvr)
+        if nvrs and not self._record_timer.isActive():
+            self._record_timer.start()
+        elif not nvrs:
+            self._record_timer.stop()
+
+    def _poll_nvr_record_status(self) -> None:
         for nvr in nvrcfg.load_nvrs():
             self._refresh_nvr_channels(nvr)
 
@@ -318,6 +334,8 @@ class MainWindow(QMainWindow):
     def _refresh_nvr_channels(self, nvr) -> None:
         from dvrip.client import DvripClient
 
+        if nvr.id in self._nvr_refreshers:
+            return  # a refresh/record-poll is already in flight for this NVR
         password = keystore.get_password(nvr_keyring_user(nvr.id))
         client = DvripClient(self, auto_discover=True)
         self._nvr_refreshers[nvr.id] = client
@@ -352,9 +370,16 @@ class MainWindow(QMainWindow):
                         break
                 nvrcfg.save_nvrs(nvrs)
                 self._rebuild_nvr_tiles()
+            # Same connection: pull record status before closing (avoids
+            # opening a second session, which the NVR's low session cap dislikes).
+            client.query_record_status()
+
+        def on_record(status: dict) -> None:
+            self.grid.set_recording_status(nvr.id, status)
             self._dispose_refresher(nvr.id)
 
         client.channelsDiscovered.connect(on_discovered)
+        client.recordStatus.connect(on_record)
         client.loginFailed.connect(lambda _r: self._dispose_refresher(nvr.id))
         client.error.connect(lambda _e: self._dispose_refresher(nvr.id))
         client.connect_to(nvr.host, nvr.port, nvr.username, password)

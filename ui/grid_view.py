@@ -108,6 +108,15 @@ class GridView(QWidget):
 
         self._relayout()
 
+    def set_recording_status(self, nvr_id: str, status: dict) -> None:
+        """Apply per-channel recording flags to this NVR's tiles.
+        ``status`` maps 1-based channel number -> bool recording."""
+        for ch_no, recording in status.items():
+            tid = nvr_tile_id(nvr_id, int(ch_no))
+            tile = self._tiles.get(tid)
+            if tile is not None and hasattr(tile, "set_recording"):
+                tile.set_recording(bool(recording))
+
     def set_nvr_channels(
         self,
         items: list[tuple["NvrConfig", "object", str]],

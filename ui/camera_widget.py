@@ -49,6 +49,13 @@ class _Overlay(QWidget):
         self._hovered = False
         self._reorder = False
         self._drop_target = False
+        self._recording = False
+
+    def set_recording(self, on: bool) -> None:
+        if self._recording == on:
+            return
+        self._recording = on
+        self.update()
 
     def set_name(self, name: str) -> None:
         self._name = name
@@ -121,6 +128,33 @@ class _Overlay(QWidget):
             font.setBold(True)
             p.setFont(font)
             p.drawText(QRect(x, y, handle_w, handle_h), Qt.AlignCenter, "⠿")
+
+        # Recording badge (top-left): red "● REC" when the channel is recording.
+        if self._recording:
+            font = QFont()
+            font.setPointSize(8)
+            font.setBold(True)
+            p.setFont(font)
+            label = "REC"
+            fm = QFontMetrics(font)
+            dot_d = 7
+            pad = 6
+            gap = 4
+            text_w = fm.horizontalAdvance(label)
+            badge_w = pad + dot_d + gap + text_w + pad
+            badge_h = 18
+            bx, by = 8, 8
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(0, 0, 0, 150))
+            p.drawRoundedRect(bx, by, badge_w, badge_h, 4, 4)
+            p.setBrush(QColor("#ef4444"))
+            p.drawEllipse(bx + pad, by + (badge_h - dot_d) // 2, dot_d, dot_d)
+            p.setPen(QColor("#f1f5f9"))
+            p.drawText(
+                QRect(bx + pad + dot_d + gap, by, text_w + 4, badge_h),
+                Qt.AlignVCenter | Qt.AlignLeft,
+                label,
+            )
 
         if not self._name and not self._status:
             return
