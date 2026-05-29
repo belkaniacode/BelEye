@@ -128,7 +128,10 @@ class MainWindow(QMainWindow):
         self._record_timer.setInterval(30_000)
         self._record_timer.timeout.connect(self._poll_nvr_record_status)
 
+        self._playback_windows: list = []
+
         self.grid = GridView(self)
+        self.grid.archiveRequested.connect(self._open_archive)
         self.grid.editRequested.connect(self._on_edit_camera)
         self.grid.removeRequested.connect(self._on_remove_camera)
         self.grid.orderChanged.connect(self._on_order_changed)
@@ -312,6 +315,23 @@ class MainWindow(QMainWindow):
     def _poll_nvr_record_status(self) -> None:
         for nvr in nvrcfg.load_nvrs():
             self._refresh_nvr_channels(nvr)
+
+    def _open_archive(self, nvr_id: str, channel_number: int) -> None:
+        from .playback_view import PlaybackView
+
+        nvr = next((n for n in nvrcfg.load_nvrs() if n.id == nvr_id), None)
+        if nvr is None:
+            return
+        ch = next((c for c in nvr.channels if c.number == channel_number), None)
+        ch_name = ch.name if ch else f"CH{channel_number:02d}"
+        password = keystore.get_password(nvr_keyring_user(nvr.id))
+        log.info("[PB] menu open nvr=%s ch=%d", nvr.name, channel_number)
+        view = PlaybackView(nvr, channel_number, ch_name, password, parent=None)
+        view.setAttribute(Qt.WA_DeleteOnClose, True)
+        view.destroyed.connect(lambda *_: self._playback_windows.remove(view)
+                               if view in self._playback_windows else None)
+        self._playback_windows.append(view)
+        view.show()
 
     def _rebuild_nvr_tiles(self) -> None:
         cameras = cfg.load_cameras()

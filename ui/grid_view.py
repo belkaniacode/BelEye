@@ -21,6 +21,7 @@ class GridView(QWidget):
     editRequested = Signal(str)
     removeRequested = Signal(str)
     orderChanged = Signal(list)  # emitted on apply_reorder with new list[id]
+    archiveRequested = Signal(str, int)  # nvr_id, channel_number
 
     MODE_GRID = "grid"
     MODE_SINGLE = "single"
@@ -150,6 +151,7 @@ class GridView(QWidget):
                 tile.removeRequested.connect(self.removeRequested)
                 tile.reconnectRequested.connect(self._on_reconnect)
                 tile.swapRequested.connect(self._on_swap)
+                tile.archiveRequested.connect(self.archiveRequested)
                 if self._reorder_mode:
                     tile.set_reorder_mode(True)
                 self._tiles[tid] = tile

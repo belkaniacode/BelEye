@@ -16,6 +16,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -88,6 +89,7 @@ class DvripClient(QObject):
         self._password: str = ""
         self._logged_in: bool = False
         self._pending_monitors: dict[int, _PendingMonitor] = {}
+        self._file_query_channel: int = 1
 
         self._keepalive = QTimer(self)
         self._keepalive.setInterval(KEEPALIVE_INTERVAL_MS)
@@ -143,6 +145,25 @@ class DvripClient(QObject):
                 },
             },
         )
+
+    def query_files(self, channel: int, begin: datetime, end: datetime) -> None:
+        """Query recorded files for ``channel`` in [begin, end]. Emits ``fileList``
+        with a list[FileRecord]. Channel is 1-based here, 0-based on the wire."""
+        if not self._logged_in:
+            log.warning("[PB] query_files before login (ch=%d)", channel)
+            return
+        self._file_query_channel = channel
+        b = begin.strftime("%Y-%m-%d %H:%M:%S")
+        e = end.strftime("%Y-%m-%d %H:%M:%S")
+        log.info("[PB] query ch=%d %s..%s", channel, b, e)
+        self._send(MsgId.FILE_QUERY_REQ, {
+            "Name": "OPFileQuery",
+            "SessionID": self._sid_str(),
+            "OPFileQuery": {
+                "BeginTime": b, "EndTime": e, "Channel": channel - 1,
+                "DriveTypeMask": 0, "Event": "*", "Type": "h264", "StreamType": 0,
+            },
+        })
 
     def query_record_status(self) -> None:
         """Request the per-channel record schedule. Emits ``recordStatus``.
@@ -447,7 +468,15 @@ class DvripClient(QObject):
     def _handle_file_query_rsp(self, pkt: Packet) -> None:
         body = _parse_json(pkt.payload)
         items = body.get("OPFileQuery") or []
-        self.fileList.emit(items)
+        channel = getattr(self, "_file_query_channel", 1)
+        records = []
+        for it in items:
+            if isinstance(it, dict):
+                rec = FileRecord.from_dict(channel, it)
+                if rec is not None:
+                    records.append(rec)
+        log.info("[PB] query ch=%d -> %d files", channel, len(records))
+        self.fileList.emit(records)
 
     # ----- helpers ------------------------------------------------------
 
@@ -458,12 +487,32 @@ class DvripClient(QObject):
 @dataclass(slots=True)
 class FileRecord:
     channel: int
-    begin_time: str
-    end_time: str
+    begin: datetime
+    end: datetime
     file_name: str
     size: int = 0
     disk: int = 0
-    extra: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, channel: int, d: dict) -> "FileRecord | None":
+        try:
+            begin = datetime.strptime(d["BeginTime"], "%Y-%m-%d %H:%M:%S")
+            end = datetime.strptime(d["EndTime"], "%Y-%m-%d %H:%M:%S")
+        except (KeyError, ValueError):
+            return None
+        size_raw = d.get("FileLength", 0)
+        try:
+            size = int(str(size_raw), 16) if isinstance(size_raw, str) else int(size_raw)
+        except (TypeError, ValueError):
+            size = 0
+        return cls(
+            channel=channel,
+            begin=begin,
+            end=end,
+            file_name=str(d.get("FileName", "")),
+            size=size,
+            disk=int(d.get("DiskNo", 0) or 0),
+        )
 
 
 def _extract_channel_count(body: dict[str, Any]) -> int:

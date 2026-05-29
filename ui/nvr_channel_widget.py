@@ -35,6 +35,7 @@ class NvrChannelTile(DraggableTileMixin, QFrame):
     removeRequested = Signal(str)      # emitted with tile_id (disables this channel)
     reconnectRequested = Signal(str)   # emitted with tile_id
     swapRequested = Signal(str, str)   # source tile_id, target tile_id
+    archiveRequested = Signal(str, int)  # nvr_id, channel_number
 
     @property
     def drag_id(self) -> str:
@@ -209,13 +210,17 @@ class NvrChannelTile(DraggableTileMixin, QFrame):
 
     def contextMenuEvent(self, event) -> None:  # noqa: N802
         menu = QMenu(self)
+        act_archive = QAction("Архив…", menu)
         act_reconnect = QAction("Переподключить", menu)
         act_remove = QAction("Скрыть этот канал", menu)
         act_edit = QAction("Настройки регистратора...", menu)
-        menu.addAction(act_reconnect)
+        menu.addAction(act_archive)
         menu.addSeparator()
+        menu.addAction(act_reconnect)
         menu.addAction(act_remove)
         menu.addAction(act_edit)
+        act_archive.triggered.connect(
+            lambda: self.archiveRequested.emit(self.nvr.id, self.channel.number))
         act_reconnect.triggered.connect(lambda: self.reconnectRequested.emit(self._tile_id))
         act_remove.triggered.connect(lambda: self.removeRequested.emit(self._tile_id))
         act_edit.triggered.connect(lambda: self.editRequested.emit(self.nvr.id))
