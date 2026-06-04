@@ -89,6 +89,7 @@ class DvripClient(QObject):
         self._password: str = ""
         self._logged_in: bool = False
         self._pending_monitors: dict[int, _PendingMonitor] = {}
+        self._pending_playback: dict | None = None
         self._file_query_channel: int = 1
 
         self._keepalive = QTimer(self)
@@ -145,6 +146,44 @@ class DvripClient(QObject):
                 },
             },
         )
+
+    def start_playback(self, file_name: str, begin: datetime, end: datetime) -> None:
+        """Play back an archived file. Hardware-verified flow (identical to live
+        monitor opcodes): claim 1413 -> 1414 Ret=100 -> start 1410. Frames then
+        arrive as MONITOR_DATA (1412) and surface on the existing ``videoChunk``
+        signal — downstream the Sofia parser + ffmpeg pipe handle it like live."""
+        if not self._logged_in:
+            log.warning("[PB] start_playback before login")
+            return
+        params = {
+            "PlayMode": "ByName",
+            "FileName": file_name,
+            "StreamType": 0,
+            "Value": 0,
+            "TransMode": "TCP",
+        }
+        body = {
+            "Action": "Claim",
+            "Parameter": params,
+            "StartTime": begin.strftime("%Y-%m-%d %H:%M:%S"),
+            "EndTime": end.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        self._pending_playback = body
+        log.info("[PB] playback claim file=%s", file_name)
+        self._send(MsgId.MONITOR_CLAIM_REQ, {
+            "Name": "OPPlayBack", "SessionID": self._sid_str(), "OPPlayBack": body,
+        })
+
+    def stop_playback(self) -> None:
+        if not self._logged_in or self._pending_playback is None:
+            return
+        log.info("[PB] playback stop")
+        params = self._pending_playback.get("Parameter", {})
+        self._send(MsgId.MONITOR_STOP_REQ, {
+            "Name": "OPPlayBack", "SessionID": self._sid_str(),
+            "OPPlayBack": {"Action": "Stop", "Parameter": params},
+        })
+        self._pending_playback = None
 
     def query_files(self, channel: int, begin: datetime, end: datetime) -> None:
         """Query recorded files for ``channel`` in [begin, end]. Emits ``fileList``
@@ -433,9 +472,19 @@ class DvripClient(QObject):
         body = _parse_json(pkt.payload)
         ret = int(body.get("Ret", -1))
         if ret != 100:
-            log.warning("[NVR] monitor claim rejected Ret=%d full=%s", ret, body)
+            log.warning("[NVR] claim rejected Ret=%d full=%s", ret, body)
             return
-        # Now send the actual Start request to begin the data stream.
+        # Branch by what was claimed: playback or live monitor.
+        if self._pending_playback is not None:
+            start_body = dict(self._pending_playback)
+            start_body["Action"] = "Start"
+            log.info("[PB] playback start")
+            self._send(MsgId.MONITOR_START_REQ, {
+                "Name": "OPPlayBack", "SessionID": self._sid_str(),
+                "OPPlayBack": start_body,
+            })
+            return
+        # Live monitor: send the actual Start request to begin the data stream.
         for pending in list(self._pending_monitors.values()):
             self._send(
                 MsgId.MONITOR_START_REQ,

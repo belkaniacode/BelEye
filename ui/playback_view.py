@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
 
 from app.nvr_config import NvrConfig
 from dvrip.client import DvripClient, FileRecord
+from dvrip.sofia_frame import SofiaFrameParser, detect_codec
 from video.ffmpeg_player import FFmpegPlayer
 
 log = logging.getLogger(__name__)
@@ -203,12 +204,19 @@ class PlaybackView(QWidget):
         self._speed_idx = 0
         self._speeds = [1, 2, 4]
 
+        # Streaming state (fed by the DVRIP videoChunk signal)
+        self._parser: SofiaFrameParser | None = None
+        self._codec_detected = False
+        self._pending_es = bytearray()
+        self._playing_rec: FileRecord | None = None
+
         # DVRIP session dedicated to this archive window.
         self._client = DvripClient(self, auto_discover=False)
         self._client.loginOk.connect(self._on_login)
         self._client.loginFailed.connect(lambda r: self._set_status(f"Логин отклонён: {r}"))
         self._client.error.connect(lambda e: self._set_status(f"Сеть: {e}"))
         self._client.fileList.connect(self._on_file_list)
+        self._client.videoChunk.connect(self._on_video_chunk)
         self._client.connect_to(nvr.host, nvr.port, nvr.username, password)
 
     # ----- session / queries -------------------------------------------
@@ -299,21 +307,67 @@ class PlaybackView(QWidget):
         if rec is None:
             self._set_status("Нет записи для воспроизведения.")
             return
-        # NOTE: OPPlayBack streaming is wired once device opcodes are verified.
-        # For now we surface the selection so the UI flow is testable.
+        if not self._client:
+            self._set_status("Нет соединения с регистратором.")
+            return
+        # Stop any in-flight playback + decoder, then start fresh.
+        try:
+            self._client.stop_playback()
+        except Exception:
+            log.exception("[PB] stop_playback failed")
+        self.player.stop()
+        self._parser = SofiaFrameParser()
+        self._parser._name = f"pb:{rec.file_name.rsplit('/', 1)[-1]}"
+        self._codec_detected = False
+        self._pending_es = bytearray()
+        self._playing_rec = rec
         log.info("[PB] start playback file=%s seek=%s", rec.file_name, seek_to)
-        self._set_status(
-            f"Воспроизведение: {rec.begin:%H:%M:%S}–{rec.end:%H:%M:%S} "
-            "(стриминг подключается следующей задачей)"
-        )
+        self._client.start_playback(rec.file_name, rec.begin, rec.end)
         self.timeline.set_cursor(seek_to or rec.begin)
+        self.btn_play.setText("⏸ Пауза")
+        self._set_status(
+            f"Воспроизведение: {rec.begin.strftime('%H:%M:%S')}–"
+            f"{rec.end.strftime('%H:%M:%S')}"
+        )
+
+    def _on_video_chunk(self, _channel: int, data: bytes) -> None:
+        if not self._parser:
+            return
+        clean = self._parser.feed(data)
+        if not clean:
+            return
+        if self._codec_detected:
+            self.player.feed_bytes(clean)
+            return
+        self._pending_es.extend(clean)
+        codec = detect_codec(bytes(self._pending_es))
+        if codec is None:
+            if len(self._pending_es) > 2_000_000:
+                codec = "h264"
+                log.warning("[PB] codec undetected, assuming h264")
+            else:
+                return
+        log.info("[PB] codec=%s, starting decoder", codec)
+        self.player.set_input_codec(codec)
+        self.player.start()
+        self.player.feed_bytes(bytes(self._pending_es))
+        self._pending_es.clear()
+        self._codec_detected = True
 
     def _on_play_pause(self) -> None:
         self._start_playback(self._selected_record())
 
     def _on_stop(self) -> None:
+        if self._client:
+            try:
+                self._client.stop_playback()
+            except Exception:
+                log.exception("[PB] stop_playback failed")
         self.player.stop()
+        self._parser = None
+        self._playing_rec = None
         self.timeline.set_cursor(None)
+        self.btn_play.setText("▶ Воспроизвести")
         self._set_status("Остановлено.")
 
     def _cycle_speed(self) -> None:

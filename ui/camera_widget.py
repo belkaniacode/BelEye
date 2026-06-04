@@ -129,29 +129,32 @@ class _Overlay(QWidget):
             p.setFont(font)
             p.drawText(QRect(x, y, handle_w, handle_h), Qt.AlignCenter, "⠿")
 
-        # Recording badge (top-left): red "● REC" when the channel is recording.
+        # Recording badge (top-left): solid-red "● REC" pill when the channel
+        # is recording. Sized to be clearly visible from across a 4-tile grid.
         if self._recording:
             font = QFont()
-            font.setPointSize(8)
+            font.setPointSize(10)
             font.setBold(True)
             p.setFont(font)
             label = "REC"
             fm = QFontMetrics(font)
-            dot_d = 7
-            pad = 6
-            gap = 4
+            dot_d = 10
+            pad_x = 9
+            gap = 6
             text_w = fm.horizontalAdvance(label)
-            badge_w = pad + dot_d + gap + text_w + pad
-            badge_h = 18
-            bx, by = 8, 8
+            badge_w = pad_x + dot_d + gap + text_w + pad_x
+            badge_h = 24
+            bx, by = 10, 10
+            # Filled red pill — unmistakable
             p.setPen(Qt.NoPen)
-            p.setBrush(QColor(0, 0, 0, 150))
-            p.drawRoundedRect(bx, by, badge_w, badge_h, 4, 4)
-            p.setBrush(QColor("#ef4444"))
-            p.drawEllipse(bx + pad, by + (badge_h - dot_d) // 2, dot_d, dot_d)
-            p.setPen(QColor("#f1f5f9"))
+            p.setBrush(QColor("#dc2626"))
+            p.drawRoundedRect(bx, by, badge_w, badge_h, badge_h // 2, badge_h // 2)
+            # White dot inside the pill
+            p.setBrush(QColor("#ffffff"))
+            p.drawEllipse(bx + pad_x, by + (badge_h - dot_d) // 2, dot_d, dot_d)
+            p.setPen(QColor("#ffffff"))
             p.drawText(
-                QRect(bx + pad + dot_d + gap, by, text_w + 4, badge_h),
+                QRect(bx + pad_x + dot_d + gap, by, text_w + 4, badge_h),
                 Qt.AlignVCenter | Qt.AlignLeft,
                 label,
             )

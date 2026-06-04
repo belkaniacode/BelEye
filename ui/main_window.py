@@ -120,10 +120,11 @@ class MainWindow(QMainWindow):
             from PySide6.QtGui import QIcon
             self.setWindowIcon(QIcon(str(icon_path)))
 
-        self._nvr_refreshers: dict = {}
+        # One persistent control connection per NVR (id -> DvripClient).
+        self._nvr_control: dict = {}
 
-        # Periodic record-status + channel refresh for NVRs (one short-lived
-        # connection per NVR per tick; kept infrequent due to low session caps).
+        # Periodic record-status poll — reuses the persistent control
+        # connections (no per-tick reconnect, to respect the NVR session cap).
         self._record_timer = QTimer(self)
         self._record_timer.setInterval(30_000)
         self._record_timer.timeout.connect(self._poll_nvr_record_status)
@@ -300,13 +301,14 @@ class MainWindow(QMainWindow):
         cameras = cfg.load_cameras()
         self.grid.set_cameras(cameras)
         self._rebuild_nvr_tiles()
-        # Reconcile saved channels with the device's actual active channels
-        # in the background, so the grid self-heals when cameras are added or
-        # removed on the NVR without the user re-probing. The same connection
-        # also pulls record status for the REC indicator.
+        # One persistent control connection per NVR handles discovery +
+        # record status. We deliberately do NOT open a fresh socket on each
+        # poll: the NVR has a low session cap, and per-tick reconnects
+        # accumulated/leaked sessions and eventually starved the live tiles
+        # ("remote host closed the connection").
         nvrs = nvrcfg.load_nvrs()
         for nvr in nvrs:
-            self._refresh_nvr_channels(nvr)
+            self._ensure_control_client(nvr)
         if nvrs and not self._record_timer.isActive():
             self._record_timer.start()
         elif not nvrs:
@@ -314,7 +316,11 @@ class MainWindow(QMainWindow):
 
     def _poll_nvr_record_status(self) -> None:
         for nvr in nvrcfg.load_nvrs():
-            self._refresh_nvr_channels(nvr)
+            client = self._nvr_control.get(nvr.id)
+            if client is None:
+                self._ensure_control_client(nvr)  # reconnect if it dropped
+            else:
+                client.query_record_status()  # reuse the existing session
 
     def _open_archive(self, nvr_id: str, channel_number: int) -> None:
         from .playback_view import PlaybackView
@@ -351,67 +357,67 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage(f"Загружено камер: {len(cameras)}", 3000)
 
-    def _refresh_nvr_channels(self, nvr) -> None:
+    def _ensure_control_client(self, nvr) -> None:
+        """Create (once) a persistent control connection for this NVR.
+
+        Discovers channels on login, then serves periodic record-status
+        queries over the SAME socket. If the connection drops, it is removed
+        so the next poll recreates it.
+        """
         from dvrip.client import DvripClient
 
-        if nvr.id in self._nvr_refreshers:
-            return  # a refresh/record-poll is already in flight for this NVR
-        password = keystore.get_password(nvr_keyring_user(nvr.id))
+        if nvr.id in self._nvr_control:
+            return
+        nvr_id = nvr.id
+        password = keystore.get_password(nvr_keyring_user(nvr_id))
         client = DvripClient(self, auto_discover=True)
-        self._nvr_refreshers[nvr.id] = client
+        self._nvr_control[nvr_id] = client
 
         def on_discovered(channels: list) -> None:
             active_map = {int(c.number): str(c.name) for c in channels}
             if not active_map:
-                self._dispose_refresher(nvr.id)
                 return
-            # Preserve the user's existing channel order; update names, append
-            # newly-discovered channels, drop channels no longer present.
             merged = [
                 nvrcfg.NvrChannel(number=c.number, name=active_map[c.number], enabled=True)
                 for c in nvr.channels
                 if c.number in active_map
             ]
-            existing_nums = {c.number for c in merged}
+            existing = {c.number for c in merged}
             for num in sorted(active_map):
-                if num not in existing_nums:
+                if num not in existing:
                     merged.append(nvrcfg.NvrChannel(number=num, name=active_map[num], enabled=True))
-
             before = [(c.number, c.name) for c in nvr.channels]
             after = [(c.number, c.name) for c in merged]
             if after != before:
                 log.info("[NVR] %s channels changed %s -> %s", nvr.name, before, after)
                 nvr.channels = merged
-                nvrs = nvrcfg.load_nvrs()
-                # update_nvr matches by id; mutate the loaded copy's channels
-                for saved_nvr in nvrs:
-                    if saved_nvr.id == nvr.id:
-                        saved_nvr.channels = merged
+                saved = nvrcfg.load_nvrs()
+                for s in saved:
+                    if s.id == nvr_id:
+                        s.channels = merged
                         break
-                nvrcfg.save_nvrs(nvrs)
+                nvrcfg.save_nvrs(saved)
                 self._rebuild_nvr_tiles()
-            # Same connection: pull record status before closing (avoids
-            # opening a second session, which the NVR's low session cap dislikes).
             client.query_record_status()
 
-        def on_record(status: dict) -> None:
-            self.grid.set_recording_status(nvr.id, status)
-            self._dispose_refresher(nvr.id)
+        def on_down() -> None:
+            c = self._nvr_control.pop(nvr_id, None)
+            if c is not None:
+                c.deleteLater()
 
         client.channelsDiscovered.connect(on_discovered)
-        client.recordStatus.connect(on_record)
-        client.loginFailed.connect(lambda _r: self._dispose_refresher(nvr.id))
-        client.error.connect(lambda _e: self._dispose_refresher(nvr.id))
+        client.recordStatus.connect(lambda st: self.grid.set_recording_status(nvr_id, st))
+        client.disconnected.connect(on_down)
         client.connect_to(nvr.host, nvr.port, nvr.username, password)
 
-    def _dispose_refresher(self, nvr_id: str) -> None:
-        client = self._nvr_refreshers.pop(nvr_id, None)
-        if client is not None:
+    def _dispose_control_clients(self) -> None:
+        for client in list(self._nvr_control.values()):
             try:
                 client.close()
             except Exception:
-                log.exception("[NVR] refresher close failed")
+                log.exception("[NVR] control close failed")
             client.deleteLater()
+        self._nvr_control.clear()
 
     def _open_settings(self) -> None:
         if self.grid.is_reorder_mode():
@@ -535,5 +541,7 @@ class MainWindow(QMainWindow):
         super().keyPressEvent(event)
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        self._record_timer.stop()
+        self._dispose_control_clients()
         self.grid.stop_all()
         super().closeEvent(event)
