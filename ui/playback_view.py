@@ -37,8 +37,11 @@ from PySide6.QtWidgets import (
 )
 
 from app.nvr_config import NvrConfig
+from PySide6.QtWidgets import QFileDialog, QMessageBox
+
 from dvrip.client import DvripClient, FileRecord
 from dvrip.sofia_frame import SofiaFrameParser, detect_codec
+from video.export import MP4Exporter
 from video.ffmpeg_player import FFmpegPlayer
 
 log = logging.getLogger(__name__)
@@ -209,6 +212,7 @@ class PlaybackView(QWidget):
         self._codec_detected = False
         self._pending_es = bytearray()
         self._playing_rec: FileRecord | None = None
+        self._exporter: MP4Exporter | None = None
 
         # DVRIP session dedicated to this archive window.
         self._client = DvripClient(self, auto_discover=False)
@@ -338,6 +342,8 @@ class PlaybackView(QWidget):
             return
         if self._codec_detected:
             self.player.feed_bytes(clean)
+            if self._exporter is not None:
+                self._exporter.feed_bytes(clean)
             return
         self._pending_es.extend(clean)
         codec = detect_codec(bytes(self._pending_es))
@@ -350,7 +356,11 @@ class PlaybackView(QWidget):
         log.info("[PB] codec=%s, starting decoder", codec)
         self.player.set_input_codec(codec)
         self.player.start()
-        self.player.feed_bytes(bytes(self._pending_es))
+        buffered = bytes(self._pending_es)
+        self.player.feed_bytes(buffered)
+        if self._exporter is not None:
+            if self._exporter.start(self._exporter_out_path, codec):
+                self._exporter.feed_bytes(buffered)
         self._pending_es.clear()
         self._codec_detected = True
 
@@ -375,7 +385,45 @@ class PlaybackView(QWidget):
         self.btn_speed.setText(f"{self._speeds[self._speed_idx]}×")
 
     def _on_export(self) -> None:
-        self._set_status("Экспорт будет доступен после подключения стриминга.")
+        rec = self._selected_record()
+        if rec is None:
+            self._set_status("Выберите запись для экспорта.")
+            return
+        if self._exporter is not None:
+            self._set_status("Экспорт уже идёт. Дождитесь завершения.")
+            return
+        suggested = (
+            f"{self.nvr.name}_{self.channel_name}_"
+            f"{rec.begin.strftime('%Y%m%d_%H%M%S')}.mp4"
+        ).replace(" ", "_")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Экспорт фрагмента в mp4", suggested, "MP4 video (*.mp4)"
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".mp4"):
+            path += ".mp4"
+        # Restart playback from the start of the record so the exported file
+        # is complete (the same chunks feed the player AND the exporter).
+        self._exporter = MP4Exporter(self)
+        self._exporter_out_path = path
+        self._exporter.progress.connect(lambda line: self._set_status(f"Экспорт: {line}"))
+        self._exporter.finished.connect(self._on_export_finished)
+        self.btn_export.setEnabled(False)
+        log.info("[export] queued out=%s file=%s", path, rec.file_name)
+        self._start_playback(rec)
+        self._set_status(f"Запись стартует для экспорта в {path}…")
+
+    def _on_export_finished(self, ok: bool, msg: str) -> None:
+        self.btn_export.setEnabled(True)
+        if self._exporter is not None:
+            self._exporter.deleteLater()
+            self._exporter = None
+        if ok:
+            QMessageBox.information(self, "Экспорт", msg)
+        else:
+            QMessageBox.warning(self, "Экспорт", msg)
+        self._set_status(msg)
 
     # ----- misc ---------------------------------------------------------
 

@@ -15,8 +15,13 @@ Built with Python, PySide6 and FFmpeg. Local-only, no cloud, no telemetry.
 
 - **Multi-camera grid** — auto-arranging layout (1, 2×2, 3×3, 4×4 …)
 - **Single-camera focus** — double-click a tile to zoom in, double-click again to return
-- **Drag-and-drop reordering** — dedicated edit mode with Apply / Cancel
-- **Low-latency playback** via FFmpeg (`-rtsp_transport tcp -fflags nobuffer -flags low_delay`)
+- **Drag-and-drop reordering** — works for both RTSP cameras and NVR channels
+- **Low-latency RTSP playback** via FFmpeg (`-rtsp_transport tcp -fflags nobuffer -flags low_delay`)
+- **NVR support (Xiongmai / XMEye / DVRIP, port 34567)** — connect to a recorder by one IP and automatically get all connected cameras; no per-camera RTSP path setup
+  - **Live H.264 / H.265 (HEVC)** decoding via in-process pipe to FFmpeg
+  - **REC indicator** — a clearly visible red "● REC" badge appears on channels that are actively recording (driven by the device's record schedule)
+  - **Archive playback** — right-click a channel → "Архив…" opens a calendar with recorded days highlighted, a per-day file list, and a 24-hour timeline with clickable record blocks
+  - **Export to mp4** — save any selected fragment to a local file by stream remux (no re-encode, no CPU)
 - **Auto-reconnect** with exponential backoff for flaky streams
 - **Per-camera error feedback** ("401 Unauthorized", "Connection refused", "timed out", …) right on the tile
 - **One bad camera never freezes the UI** — fully event-driven QProcess pipeline, no blocking on the GUI thread
