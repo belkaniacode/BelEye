@@ -227,18 +227,23 @@ class DvripClient(QObject):
             },
         })
 
-        # Step 3+4: send OPPlayBack Claim AND Start after a 150 ms gap so the
+        # Step 3+4: send OPPlayBack Claim AND Start after a 250 ms gap so the
         # firmware finishes binding "active channel" to the OPMonitor. Without
-        # the gap, ch=1 (and any other channel under contention with a live
-        # tile) gets the OPMonitor revoked with Ret=103 before playback sees
-        # MONITOR_DATA — matrix probe relied on the natural inter-packet
-        # delay of its dispatch path to give the same headroom.
+        # the gap, channels currently watched by a live tile get the
+        # pre-OPMonitor revoked with Ret=103 before playback sees data.
+        # We ALSO redundantly carry the channel in Parameter.Channel and
+        # Parameter.Value as belt-and-suspenders: when the pre-OPMonitor is
+        # rejected (e.g. ch=2 is already held by a live tile on a different
+        # socket), at least one of these hints may steer the playback to the
+        # correct port on some firmware revisions. They are no-ops on the
+        # firmware that needs the pre-OPMonitor route.
         params = {
             "PlayMode": "ByName",
             "FileName": file_name,
             "StreamType": 0,
-            "Value": 0,
+            "Value": channel - 1,
             "TransMode": "TCP",
+            "Channel": channel - 1,
         }
         body = {
             "Action": "Claim",
@@ -264,7 +269,7 @@ class DvripClient(QObject):
                 "OPPlayBack": start_body,
             })
 
-        QTimer.singleShot(150, _send_playback_after_delay)
+        QTimer.singleShot(250, _send_playback_after_delay)
 
     def stop_playback(self) -> None:
         if not self._logged_in or self._pending_playback is None:
