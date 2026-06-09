@@ -38,6 +38,9 @@ class NvrConfig:
     port: int = 34567
     username: str = "admin"
     channels: list[NvrChannel] = field(default_factory=list)
+    # [FIX perf] Live tiles request the sub stream by default — Main is heavy
+    # and on 4+ channels saturates the NVR encoder + LAN, causing freezes.
+    prefer_substream: bool = True
 
     @classmethod
     def from_dict(cls, data: dict) -> "NvrConfig":
@@ -48,6 +51,7 @@ class NvrConfig:
             port=int(data.get("port", 34567)),
             username=data.get("username", "admin"),
             channels=[NvrChannel.from_dict(c) for c in (data.get("channels") or [])],
+            prefer_substream=bool(data.get("prefer_substream", True)),
         )
 
     def to_dict(self) -> dict:

@@ -189,7 +189,14 @@ class FFmpegPlayer(QWidget):
             args = [
                 "-hide_banner",
                 "-loglevel", "info",
-                "-fflags", "nobuffer",
+                # [FIX perf] Cut ffmpeg's default 5 s / 5 MB probe to a
+                # constant — pipe input gives us the codec up-front, so
+                # extra probing only adds startup latency. The combined
+                # "nobuffer+discardcorrupt" flag drops partial frames on
+                # the rare resync glitch instead of stalling the decoder.
+                "-probesize", "32",
+                "-analyzeduration", "0",
+                "-fflags", "nobuffer+discardcorrupt",
                 "-flags", "low_delay",
                 "-f", self._input_codec,
                 "-i", "pipe:0",

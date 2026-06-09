@@ -166,20 +166,48 @@ class SofiaFrameParser:
 def detect_codec(data: bytes) -> str | None:
     """Inspect an Annex-B elementary stream and return 'h264', 'hevc', or None.
 
-    Scans for NAL start codes and classifies by the parameter-set NAL types:
-      H.264: SPS=7, PPS=8 (nal_type = byte & 0x1F)
-      HEVC:  VPS=32, SPS=33, PPS=34 (nal_type = (byte >> 1) & 0x3F)
+    [FIX codec] Recognise BOTH parameter sets AND IDR slices — Xiongmai
+    OPPlayBack often emits an I-frame whose first NAL is an IDR slice
+    rather than a VPS/SPS/PPS, so a parameter-set-only check returns None
+    and the caller falls back to the wrong codec.
+
+      H.264 (nal_type = byte & 0x1F):
+        5  = IDR slice
+        7  = SPS
+        8  = PPS
+      HEVC  (nal_type = (byte >> 1) & 0x3F, forbidden_zero bit must be 0):
+        19, 20 = IDR_W_RADL / IDR_N_LP
+        32, 33, 34 = VPS / SPS / PPS
+
+    HEVC NAL header has the forbidden_zero bit in bit 7 (must be 0); a
+    well-formed HEVC byte therefore has high bit 0. We use that to break
+    ties when both classifications would otherwise match (e.g. some byte
+    values give a legal H.264 type AND a legal HEVC type — the HEVC
+    forbidden-zero check resolves the ambiguity).
     """
+    HEVC_IRAP = (19, 20)
+    HEVC_PARAM = (32, 33, 34)
+    H264_IDR_OR_PARAM = (5, 7, 8)
+
+    # NOTE: order matters. Bytes like 0x28 mean "HEVC IDR_N_LP" but also
+    # parse as "H.264 PPS with ref_idc=1". Real-world H.264 SPS/PPS use
+    # ref_idc=3 (bytes 0x67/0x68 for SPS/PPS), which are NEVER valid HEVC
+    # IRAP/param types — so we check HEVC ranges first.
     i = 0
     n = len(data)
     while i < n - 4:
         if data[i:i + 3] == b"\x00\x00\x01":
             nb = data[i + 3]
-            hevc_type = (nb >> 1) & 0x3F
             h264_type = nb & 0x1F
-            if hevc_type in (32, 33, 34):       # VPS / SPS / PPS (HEVC)
+            hevc_type = (nb >> 1) & 0x3F
+            hevc_ok = (nb & 0x80) == 0  # forbidden_zero must be 0
+            if hevc_ok and hevc_type in HEVC_PARAM:
                 return "hevc"
-            if h264_type in (7, 8):             # SPS / PPS (H.264)
+            if hevc_ok and hevc_type in HEVC_IRAP:
+                return "hevc"
+            if h264_type in (7, 8):
+                return "h264"
+            if h264_type == 5:
                 return "h264"
             i += 3
         else:

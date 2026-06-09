@@ -67,6 +67,10 @@ class NvrChannelTile(DraggableTileMixin, QFrame):
 
         self._overlay = _Overlay(self)
         self._overlay.set_name(f"{nvr.name} · {channel.name}")
+        # [FIX uxbug] Big identity badge so the user can tell which NVR port
+        # this tile maps to — necessary after drag-drop reorder, where the
+        # visual position no longer matches the port number.
+        self._overlay.set_identity_badge(f"{channel.name} · #{channel.number}")
         self._overlay.set_status("connecting")
 
         layout = QVBoxLayout(self)
@@ -104,10 +108,11 @@ class NvrChannelTile(DraggableTileMixin, QFrame):
         self._first_chunk_logged = False
         self._parser = SofiaFrameParser()
         self._parser._name = self._tile_id  # for log readability
-        # Player start is deferred until we detect the codec (h264 vs hevc)
-        # from the first parameter-set NAL in the elementary stream.
+        # [FIX perf] No more 2 MB accumulator. We start ffmpeg on the FIRST
+        # non-empty Sofia output (an I-frame payload, which on Xiongmai
+        # firmwares already carries SPS/VPS/PPS). If detect_codec can't tell
+        # we default to h264 — main path on these devices.
         self._codec_detected = False
-        self._pending_es = bytearray()
         self._spawn_client()
 
     def stop(self) -> None:
@@ -144,10 +149,15 @@ class NvrChannelTile(DraggableTileMixin, QFrame):
     def _on_login_ok(self, _sid: int) -> None:
         if self._client is None:
             return
-        # Start live monitor for our specific channel.
-        log.info("[NVR] tile %s login ok; starting OPMonitor ch=%d",
-                 self._tile_id, self.channel.number)
-        self._client.start_monitor(self.channel.number, stream_type="Main")
+        # [FIX perf] Default to the sub stream for the grid view — lower bitrate
+        # avoids saturating the NVR encoder / LAN when multiple tiles share the
+        # same device. Main stream stays available for the single-cam view.
+        stream = "Extra1" if getattr(self.nvr, "prefer_substream", True) else "Main"
+        log.info(
+            "[FIX perf] tile %s login ok; starting OPMonitor ch=%d stream=%s",
+            self._tile_id, self.channel.number, stream,
+        )
+        self._client.start_monitor(self.channel.number, stream_type=stream)
 
     def _on_session_failed(self, reason: str) -> None:
         log.warning("[NVR] tile %s session failure: %s", self._tile_id, reason)
@@ -172,21 +182,19 @@ class NvrChannelTile(DraggableTileMixin, QFrame):
             self.player.feed_bytes(clean)
             return
 
-        # Still detecting: accumulate until we see a parameter-set NAL.
-        self._pending_es.extend(clean)
-        codec = detect_codec(bytes(self._pending_es))
-        if codec is None:
-            if len(self._pending_es) > 2_000_000:
-                # Give up detecting; assume h264 to avoid unbounded buffering.
-                codec = "h264"
-                log.warning("[NVR] tile %s codec undetected, assuming h264", self._tile_id)
-            else:
-                return
-        log.info("[NVR] tile %s codec=%s, starting decoder", self._tile_id, codec)
+        # [FIX perf] Start ffmpeg on the FIRST non-empty Sofia output. The
+        # Sofia parser only yields I-frame and P-frame payloads, and an
+        # I-frame on Xiongmai already carries SPS/VPS/PPS — so detect_codec
+        # almost always succeeds on the very first chunk. If not, default to
+        # h264 instead of buffering megabytes.
+        codec = detect_codec(clean) or "h264"
+        log.info(
+            "[FIX perf] tile %s codec=%s, starting decoder (chunk=%d B)",
+            self._tile_id, codec, len(clean),
+        )
         self.player.set_input_codec(codec)
         self.player.start()
-        self.player.feed_bytes(bytes(self._pending_es))
-        self._pending_es.clear()
+        self.player.feed_bytes(clean)
         self._codec_detected = True
 
     # ----- events ------------------------------------------------------

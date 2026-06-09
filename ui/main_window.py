@@ -327,17 +327,35 @@ class MainWindow(QMainWindow):
 
         nvr = next((n for n in nvrcfg.load_nvrs() if n.id == nvr_id), None)
         if nvr is None:
+            log.warning("[FIX archive] menu open ignored: nvr id %s not found", nvr_id)
             return
         ch = next((c for c in nvr.channels if c.number == channel_number), None)
         ch_name = ch.name if ch else f"CH{channel_number:02d}"
         password = keystore.get_password(nvr_keyring_user(nvr.id))
-        log.info("[PB] menu open nvr=%s ch=%d", nvr.name, channel_number)
-        view = PlaybackView(nvr, channel_number, ch_name, password, parent=None)
+        log.info("[FIX archive] menu open nvr=%s ch=%d", nvr.name, channel_number)
+        try:
+            view = PlaybackView(nvr, channel_number, ch_name, password, parent=None)
+        except Exception:
+            # [FIX archive] Any exception during PlaybackView construction
+            # used to be swallowed silently — the user just saw "nothing
+            # opens" with no clue why. Log the full traceback so we can
+            # see exactly where the constructor died.
+            log.exception("[FIX archive] PlaybackView construction failed")
+            return
         view.setAttribute(Qt.WA_DeleteOnClose, True)
         view.destroyed.connect(lambda *_: self._playback_windows.remove(view)
                                if view in self._playback_windows else None)
         self._playback_windows.append(view)
         view.show()
+        # [FIX archive] Make sure the window actually surfaces above the
+        # main window — on some WMs `show()` alone leaves it behind the
+        # parent and the user thinks "nothing happened".
+        view.raise_()
+        view.activateWindow()
+        log.info(
+            "[FIX archive] PlaybackView shown visible=%s geometry=%s",
+            view.isVisible(), view.geometry(),
+        )
 
     def _rebuild_nvr_tiles(self) -> None:
         cameras = cfg.load_cameras()

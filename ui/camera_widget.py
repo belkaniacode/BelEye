@@ -50,11 +50,25 @@ class _Overlay(QWidget):
         self._reorder = False
         self._drop_target = False
         self._recording = False
+        # [FIX uxbug] Optional big "identity badge" — used by NVR tiles to make
+        # the camera name + port number unmistakable from across the grid. The
+        # bottom-left thin caption alone is too small to read on multi-tile
+        # layouts, and after a drag-drop reorder the position in the grid
+        # diverges from the NVR's port numbering — the user clicked tile #2
+        # expecting CAM02 but got CAM04 because his persisted order is
+        # [CAM01, CAM04, CAM03, CAM02].
+        self._identity_badge: str = ""
 
     def set_recording(self, on: bool) -> None:
         if self._recording == on:
             return
         self._recording = on
+        self.update()
+
+    def set_identity_badge(self, text: str) -> None:
+        if self._identity_badge == text:
+            return
+        self._identity_badge = text
         self.update()
 
     def set_name(self, name: str) -> None:
@@ -157,6 +171,33 @@ class _Overlay(QWidget):
                 QRect(bx + pad_x + dot_d + gap, by, text_w + 4, badge_h),
                 Qt.AlignVCenter | Qt.AlignLeft,
                 label,
+            )
+
+        # [FIX uxbug] Big identity badge — top-right of the tile, mirror of
+        # the REC badge on the left. Always-on text in a contrasting pill so
+        # the user can tell at a glance "this tile is CAM04 / port 4" even
+        # in a 4-up grid. Disambiguates the post-reorder scenario where the
+        # grid position doesn't match the NVR's port numbering.
+        if self._identity_badge:
+            font = QFont()
+            font.setPointSize(11)
+            font.setBold(True)
+            p.setFont(font)
+            fm = QFontMetrics(font)
+            text_w = fm.horizontalAdvance(self._identity_badge)
+            pad_x = 10
+            badge_w = pad_x * 2 + text_w
+            badge_h = 24
+            bx = self.width() - badge_w - 10
+            by = 10
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(15, 23, 42, 220))  # near-black translucent pill
+            p.drawRoundedRect(bx, by, badge_w, badge_h, badge_h // 2, badge_h // 2)
+            p.setPen(QColor("#fef3c7"))  # amber-50 — high contrast
+            p.drawText(
+                QRect(bx, by, badge_w, badge_h),
+                Qt.AlignCenter,
+                self._identity_badge,
             )
 
         if not self._name and not self._status:

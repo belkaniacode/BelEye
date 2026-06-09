@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, time, timedelta
 
-from PySide6.QtCore import QDate, Qt, Signal
+from PySide6.QtCore import QDate, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QTextCharFormat
 from PySide6.QtWidgets import (
     QCalendarWidget,
@@ -136,10 +136,20 @@ class PlaybackView(QWidget):
         self._day_records: list[FileRecord] = []
         self._loading_scope = "month"  # "month" | "day"
 
+        # [FIX uxbug] Always include the NVR port number — after drag-drop
+        # reorder the camera at "grid position 2" may map to port 4. The
+        # user repeatedly hit "I clicked the 2nd camera but got CAM04 / port
+        # 4 records" — having the port in the title settles it.
         self.setWindowTitle(
-            f"Архив — {nvr.name} / {channel_name} / "
+            f"Архив — {nvr.name} / {channel_name} (порт #{channel_number}) / "
             f"{QDate.currentDate().toString('yyyy-MM-dd')}"
         )
+        # [FIX channel] Some Xiongmai/HVR firmware always replies with the
+        # CAM01 stream regardless of which channel's file was requested.
+        # We tested four different protocol variants — all returned the
+        # same CAM01 watermark. The file LIST is correct per channel; only
+        # the PLAYBACK content may be misrouted on affected devices.
+        self._firmware_warning_shown = False
         self.resize(1100, 680)
 
         # Left column: calendar + file list
@@ -210,7 +220,20 @@ class PlaybackView(QWidget):
         # Streaming state (fed by the DVRIP videoChunk signal)
         self._parser: SofiaFrameParser | None = None
         self._codec_detected = False
-        self._pending_es = bytearray()
+        # [FIX codec] Small accumulator (capped at 256 KB ≈ 0.1 s of HEVC main
+        # stream) so detect_codec gets at least one full I-frame before we
+        # commit ffmpeg to a wrong codec. Replaces the prior "start on the
+        # first chunk" path that crashed playback when the first NAL was an
+        # IDR slice (no SPS/VPS) — see [FIX codec] in dvrip/sofia_frame.py.
+        self._pending_es: bytearray = bytearray()
+        self._codec_detect_cap: int = 256 * 1024
+        # NVR-side "Stop then immediately Claim again" sometimes makes the
+        # firmware drop the new claim. We delay the new playback by a few
+        # hundred ms after a stop so the device is ready.
+        self._restart_timer = QTimer(self)
+        self._restart_timer.setSingleShot(True)
+        self._restart_timer.timeout.connect(self._do_start_playback)
+        self._restart_pending: tuple[FileRecord, datetime | None] | None = None
         self._playing_rec: FileRecord | None = None
         self._exporter: MP4Exporter | None = None
 
@@ -243,19 +266,67 @@ class PlaybackView(QWidget):
         if self._loading_scope == "month":
             self._month_records = records
             self._highlight_days()
+            # [FIX uxbug] After loading the month, jump to the day that
+            # actually has data. Otherwise the user lands on "today" which —
+            # if the NVR has overwritten that range — looks identical to
+            # "the feature is broken". Empty calendar+empty list was the
+            # original confusion in screenshot 20260608_224544.
+            self._auto_select_latest_day_with_records()
             self._refresh_day()
         else:
             self._day_records = records
             self._populate_day(records)
 
     def _highlight_days(self) -> None:
-        fmt = QTextCharFormat()
-        fmt.setForeground(QColor("#3b82f6"))
-        fmt.setFontWeight(75)
-        days_with = {r.begin.date() for r in self._month_records}
-        for d in days_with:
-            self.calendar.setDateTextFormat(QDate(d.year, d.month, d.day), fmt)
-        log.info("[PB] month days_with_records=%d", len(days_with))
+        # [FIX uxbug] The old highlight used a blue foreground only, which on
+        # dark themes was visually indistinguishable from the calendar's
+        # "muted other-month" cells. We now paint a coloured background pill
+        # so days with recordings are *unmistakable*.
+        normal_fmt = QTextCharFormat()
+        normal_fmt.setForeground(QColor("#ffffff"))
+        normal_fmt.setBackground(QColor("#1e40af"))   # bold blue background
+        normal_fmt.setFontWeight(75)
+        # Days that have any event-triggered (motion/alarm/human) records get
+        # an accent so the user can spot incident days at a glance.
+        event_fmt = QTextCharFormat()
+        event_fmt.setForeground(QColor("#0b0d10"))
+        event_fmt.setBackground(QColor("#eab308"))    # amber for incident day
+        event_fmt.setFontWeight(75)
+
+        days_any = {r.begin.date() for r in self._month_records}
+        days_event = {
+            r.begin.date()
+            for r in self._month_records
+            if getattr(r, "event_type", "normal") != "normal"
+        }
+        # Apply normal-day format first, then overwrite with event format so
+        # incident days win.
+        for d in days_any:
+            qd = QDate(d.year, d.month, d.day)
+            self.calendar.setDateTextFormat(qd, normal_fmt)
+        for d in days_event:
+            qd = QDate(d.year, d.month, d.day)
+            self.calendar.setDateTextFormat(qd, event_fmt)
+        log.info(
+            "[FIX uxbug] highlight days_with_records=%d (incident_days=%d)",
+            len(days_any), len(days_event),
+        )
+
+    def _auto_select_latest_day_with_records(self) -> None:
+        if not self._month_records:
+            self._set_status("За этот месяц записей нет.")
+            return
+        latest = max(r.begin.date() for r in self._month_records)
+        target = QDate(latest.year, latest.month, latest.day)
+        if self.calendar.selectedDate() == target:
+            return
+        log.info("[FIX uxbug] auto-select latest day with records: %s", latest)
+        # Block the selectionChanged loop so _refresh_day runs only once below.
+        self.calendar.blockSignals(True)
+        try:
+            self.calendar.setSelectedDate(target)
+        finally:
+            self.calendar.blockSignals(False)
 
     def _on_day_selected(self) -> None:
         self._refresh_day()
@@ -269,16 +340,39 @@ class PlaybackView(QWidget):
         self._day_records = records
         self._populate_day(records)
 
+    # [FIX arch] Color-coded markers for the per-day list. Matches the
+    # event_type set by DvripClient.query_files().
+    _EVENT_DOTS: dict[str, tuple[str, str]] = {
+        "normal": ("●", "#3b82f6"),   # blue   — continuous record
+        "motion": ("●", "#eab308"),   # yellow — motion-triggered
+        "alarm":  ("●", "#dc2626"),   # red    — alarm-triggered
+        "human":  ("●", "#22c55e"),   # green  — human detection
+    }
+    _EVENT_LABELS: dict[str, str] = {
+        "normal": "Запись",
+        "motion": "Движение",
+        "alarm":  "Тревога",
+        "human":  "Человек",
+    }
+
     def _populate_day(self, records: list[FileRecord]) -> None:
         self.file_list.clear()
         for rec in records:
-            label = f"{rec.begin:%H:%M:%S}–{rec.end:%H:%M:%S}   ({rec.size // 1024} KB)"
+            etype = getattr(rec, "event_type", "normal")
+            dot, color = self._EVENT_DOTS.get(etype, self._EVENT_DOTS["normal"])
+            event_label = self._EVENT_LABELS.get(etype, "Запись")
+            label = (
+                f"{dot}  {rec.begin:%H:%M:%S}–{rec.end:%H:%M:%S}   "
+                f"{event_label}   ({rec.size // 1024} KB)"
+            )
             item = QListWidgetItem(label)
+            item.setForeground(QColor(color))
             item.setData(Qt.UserRole, rec)
             self.file_list.addItem(item)
         self.timeline.set_day(self.calendar.selectedDate(), records)
         self.setWindowTitle(
-            f"Архив — {self.nvr.name} / {self.channel_name} / "
+            f"Архив — {self.nvr.name} / {self.channel_name} "
+            f"(порт #{self.channel_number}) / "
             f"{self.calendar.selectedDate().toString('yyyy-MM-dd')}"
         )
         self._set_status(
@@ -314,19 +408,43 @@ class PlaybackView(QWidget):
         if not self._client:
             self._set_status("Нет соединения с регистратором.")
             return
-        # Stop any in-flight playback + decoder, then start fresh.
+        # [FIX codec] Tear EVERYTHING down before the next claim — ffmpeg
+        # subprocess, parser, accumulator, and tell the NVR to stop. Any
+        # MONITOR_DATA chunks still in flight from the previous playback
+        # would otherwise contaminate the new parser and corrupt detect_codec.
         try:
             self._client.stop_playback()
         except Exception:
             log.exception("[PB] stop_playback failed")
         self.player.stop()
+        self._parser = None
+        self._codec_detected = False
+        self._pending_es.clear()
+        self._playing_rec = None
+        # Give the NVR a moment to actually free the playback session before
+        # the new Claim arrives — sequential stop+claim is the usual cause of
+        # the second playback never starting.
+        self._restart_pending = (rec, seek_to)
+        log.info("[FIX codec] PB scheduling start in 200 ms file=%s seek=%s",
+                 rec.file_name, seek_to)
+        self._restart_timer.start(200)
+
+    def _do_start_playback(self) -> None:
+        if self._restart_pending is None or not self._client:
+            return
+        rec, seek_to = self._restart_pending
+        self._restart_pending = None
         self._parser = SofiaFrameParser()
         self._parser._name = f"pb:{rec.file_name.rsplit('/', 1)[-1]}"
         self._codec_detected = False
-        self._pending_es = bytearray()
+        self._pending_es.clear()
         self._playing_rec = rec
-        log.info("[PB] start playback file=%s seek=%s", rec.file_name, seek_to)
-        self._client.start_playback(rec.file_name, rec.begin, rec.end)
+        log.info("[FIX codec] PB start playback file=%s seek=%s", rec.file_name, seek_to)
+        # [FIX channel] Pass the channel — without it the NVR streams CAM01
+        # for every playback request regardless of which file was named.
+        self._client.start_playback(
+            rec.file_name, rec.begin, rec.end, channel=self.channel_number
+        )
         self.timeline.set_cursor(seek_to or rec.begin)
         self.btn_play.setText("⏸ Пауза")
         self._set_status(
@@ -336,6 +454,8 @@ class PlaybackView(QWidget):
 
     def _on_video_chunk(self, _channel: int, data: bytes) -> None:
         if not self._parser:
+            # Chunks arriving between stop and (delayed) start — drop them so
+            # they don't contaminate the next detection pass.
             return
         clean = self._parser.feed(data)
         if not clean:
@@ -345,29 +465,45 @@ class PlaybackView(QWidget):
             if self._exporter is not None:
                 self._exporter.feed_bytes(clean)
             return
+
+        # [FIX codec] Accumulate up to 256 KB and detect on the whole window,
+        # then start ffmpeg. detect_codec now recognises both parameter sets
+        # and IDR slices, so this normally succeeds inside the first chunk.
+        # If even after the cap we cannot tell, default to HEVC — Xiongmai
+        # main stream (which OPPlayBack always uses) is H.265 by default.
         self._pending_es.extend(clean)
         codec = detect_codec(bytes(self._pending_es))
         if codec is None:
-            if len(self._pending_es) > 2_000_000:
-                codec = "h264"
-                log.warning("[PB] codec undetected, assuming h264")
-            else:
+            if len(self._pending_es) < self._codec_detect_cap:
                 return
-        log.info("[PB] codec=%s, starting decoder", codec)
+            codec = "hevc"
+            log.warning(
+                "[FIX codec] PB codec undetected after %d B buffered — defaulting hevc",
+                len(self._pending_es),
+            )
+        buffered = bytes(self._pending_es)
+        self._pending_es.clear()
+        log.info(
+            "[FIX codec] PB codec=%s, starting decoder (buffered %d B)",
+            codec, len(buffered),
+        )
         self.player.set_input_codec(codec)
         self.player.start()
-        buffered = bytes(self._pending_es)
         self.player.feed_bytes(buffered)
         if self._exporter is not None:
             if self._exporter.start(self._exporter_out_path, codec):
                 self._exporter.feed_bytes(buffered)
-        self._pending_es.clear()
         self._codec_detected = True
 
     def _on_play_pause(self) -> None:
         self._start_playback(self._selected_record())
 
     def _on_stop(self) -> None:
+        # [FIX codec] Cancel any pending delayed-start, otherwise it would
+        # fire after the user pressed Stop and re-open a playback we just
+        # tore down.
+        self._restart_timer.stop()
+        self._restart_pending = None
         if self._client:
             try:
                 self._client.stop_playback()
@@ -375,6 +511,8 @@ class PlaybackView(QWidget):
                 log.exception("[PB] stop_playback failed")
         self.player.stop()
         self._parser = None
+        self._pending_es.clear()
+        self._codec_detected = False
         self._playing_rec = None
         self.timeline.set_cursor(None)
         self.btn_play.setText("▶ Воспроизвести")

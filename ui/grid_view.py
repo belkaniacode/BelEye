@@ -168,6 +168,11 @@ class GridView(QWidget):
                 existing.channel = channel
                 existing._password = password
                 existing._overlay.set_name(f"{nvr.name} · {channel.name}")
+                # [FIX uxbug] Keep the identity badge in sync when channel is
+                # renamed in NVR settings.
+                existing._overlay.set_identity_badge(
+                    f"{channel.name} · #{channel.number}"
+                )
                 if changed:
                     existing.reload_credentials()
         self._relayout()

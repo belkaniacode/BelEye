@@ -28,8 +28,13 @@ from .packet import Packet, pack, unpack
 
 log = logging.getLogger(__name__)
 
-KEEPALIVE_INTERVAL_MS = 20_000
+KEEPALIVE_INTERVAL_MS = 10_000  # [FIX perf] was 20s — consumer NVRs idle-close ~15s
 DEFAULT_PORT = 34567
+
+# [FIX arch] Wildcard "*" returns ONLY continuous segments on many Xiongmai
+# firmwares; motion/alarm/human events are stored as separate records and
+# require a per-event query. We send the full set and merge.
+FILE_QUERY_EVENTS: tuple[str, ...] = ("*", "A", "M", "H")
 
 
 @dataclass(slots=True)
@@ -77,6 +82,9 @@ class DvripClient(QObject):
         # makes the firmware reject the monitor claim with Ret=103).
         self._auto_discover = auto_discover
         self._sock = QTcpSocket(self)
+        # [FIX perf] Disable Nagle — DVRIP is request/response with small bursts
+        # plus tightly-packed video frames; Nagle adds 40 ms ACK lag per write.
+        self._sock.setSocketOption(QAbstractSocket.LowDelayOption, 1)
         self._sock.connected.connect(self._on_connected)
         self._sock.disconnected.connect(self._on_disconnected)
         self._sock.readyRead.connect(self._on_ready_read)
@@ -90,7 +98,15 @@ class DvripClient(QObject):
         self._logged_in: bool = False
         self._pending_monitors: dict[int, _PendingMonitor] = {}
         self._pending_playback: dict | None = None
+        # [FIX arch] Multi-event file-query state. We send one request per event
+        # filter and aggregate. Native XMEye does the same — wildcard alone
+        # misses motion/alarm segments on most Xiongmai firmwares.
         self._file_query_channel: int = 1
+        self._file_query_begin: datetime | None = None
+        self._file_query_end: datetime | None = None
+        self._file_query_queue: list[str] = []
+        self._file_query_current_event: str | None = None
+        self._file_query_accumulator: dict[tuple[str, str], FileRecord] = {}
 
         self._keepalive = QTimer(self)
         self._keepalive.setInterval(KEEPALIVE_INTERVAL_MS)
@@ -147,20 +163,45 @@ class DvripClient(QObject):
             },
         )
 
-    def start_playback(self, file_name: str, begin: datetime, end: datetime) -> None:
+    def start_playback(
+        self,
+        file_name: str,
+        begin: datetime,
+        end: datetime,
+        channel: int = 1,
+    ) -> None:
         """Play back an archived file. Hardware-verified flow (identical to live
         monitor opcodes): claim 1413 -> 1414 Ret=100 -> start 1410. Frames then
         arrive as MONITOR_DATA (1412) and surface on the existing ``videoChunk``
-        signal — downstream the Sofia parser + ffmpeg pipe handle it like live."""
+        signal — downstream the Sofia parser + ffmpeg pipe handle it like live.
+
+        [FIX channel] ``channel`` is 1-based on the caller side, 0-based on the
+        wire. Without this field Xiongmai firmware ignores the ``FileName``
+        path and streams channel 0 (CAM01) for EVERY playback request — the
+        same garden scene shows up regardless of which file you asked for.
+        Hardware-verified by capturing the first I-frame of files in
+        /001/, /002/, /004/ folders without the Channel field — all three
+        returned identical CAM01 frames.
+        """
         if not self._logged_in:
             log.warning("[PB] start_playback before login")
             return
+        # [FIX channel] Try the documented channel hint locations. On the
+        # user's HVR firmware (Xiongmai), all three sites tested (Parameter
+        # Channel, Parameter Value, top-level Channel) and opcode 1420
+        # (PLAYBACK_CLAIM_REQ) accept the claim with Ret=100 but the NVR
+        # still streams CAM01 for every file. This appears to be a
+        # firmware-level routing bug — XMEye must be using an undocumented
+        # opcode/field combination we have not reverse-engineered yet.
+        # Keep these fields set in case other firmware revisions honour
+        # them.
         params = {
             "PlayMode": "ByName",
             "FileName": file_name,
             "StreamType": 0,
-            "Value": 0,
+            "Value": channel - 1,
             "TransMode": "TCP",
+            "Channel": channel - 1,
         }
         body = {
             "Action": "Claim",
@@ -168,6 +209,11 @@ class DvripClient(QObject):
             "StartTime": begin.strftime("%Y-%m-%d %H:%M:%S"),
             "EndTime": end.strftime("%Y-%m-%d %H:%M:%S"),
         }
+        log.info(
+            "[FIX channel] OPPlayBack claim ch=%d file=%s "
+            "(note: some Xiongmai firmware routes only CAM01 regardless of channel)",
+            channel, file_name,
+        )
         self._pending_playback = body
         log.info("[PB] playback claim file=%s", file_name)
         self._send(MsgId.MONITOR_CLAIM_REQ, {
@@ -187,20 +233,52 @@ class DvripClient(QObject):
 
     def query_files(self, channel: int, begin: datetime, end: datetime) -> None:
         """Query recorded files for ``channel`` in [begin, end]. Emits ``fileList``
-        with a list[FileRecord]. Channel is 1-based here, 0-based on the wire."""
+        with a list[FileRecord]. Channel is 1-based here, 0-based on the wire.
+
+        [FIX arch] Issues ONE request per event filter (``*``, ``A``, ``M``,
+        ``H``) sequentially and merges the responses, because Xiongmai
+        firmwares only return continuous segments for the wildcard query and
+        keep motion/alarm/human segments behind explicit ``Event=X`` filters.
+        """
         if not self._logged_in:
             log.warning("[PB] query_files before login (ch=%d)", channel)
             return
         self._file_query_channel = channel
-        b = begin.strftime("%Y-%m-%d %H:%M:%S")
-        e = end.strftime("%Y-%m-%d %H:%M:%S")
-        log.info("[PB] query ch=%d %s..%s", channel, b, e)
+        self._file_query_begin = begin
+        self._file_query_end = end
+        self._file_query_queue = list(FILE_QUERY_EVENTS)
+        self._file_query_current_event = None
+        self._file_query_accumulator = {}
+        log.info(
+            "[FIX arch] query ch=%d %s..%s events=%s",
+            channel,
+            begin.strftime("%Y-%m-%d %H:%M:%S"),
+            end.strftime("%Y-%m-%d %H:%M:%S"),
+            self._file_query_queue,
+        )
+        self._send_next_file_query()
+
+    def _send_next_file_query(self) -> None:
+        if not self._file_query_queue:
+            return
+        if self._file_query_begin is None or self._file_query_end is None:
+            return
+        event = self._file_query_queue.pop(0)
+        self._file_query_current_event = event
+        b = self._file_query_begin.strftime("%Y-%m-%d %H:%M:%S")
+        e = self._file_query_end.strftime("%Y-%m-%d %H:%M:%S")
+        log.info(
+            "[FIX arch] sending query ch=%d event=%s",
+            self._file_query_channel, event,
+        )
         self._send(MsgId.FILE_QUERY_REQ, {
             "Name": "OPFileQuery",
             "SessionID": self._sid_str(),
             "OPFileQuery": {
-                "BeginTime": b, "EndTime": e, "Channel": channel - 1,
-                "DriveTypeMask": 0, "Event": "*", "Type": "h264", "StreamType": 0,
+                "BeginTime": b, "EndTime": e,
+                "Channel": self._file_query_channel - 1,
+                "DriveTypeMask": 0, "Event": event,
+                "Type": "h264", "StreamType": 0,
             },
         })
 
@@ -250,6 +328,11 @@ class DvripClient(QObject):
         self._keepalive.stop()
         self._logged_in = False
         self._session_id = 0
+        # [FIX arch] Don't leave a half-finished multi-event file query in
+        # the queued state — next session would start mid-flight.
+        self._file_query_queue = []
+        self._file_query_current_event = None
+        self._file_query_accumulator = {}
         self.disconnected.emit()
 
     def _on_socket_error(self, _err: QAbstractSocket.SocketError) -> None:
@@ -516,21 +599,67 @@ class DvripClient(QObject):
 
     def _handle_file_query_rsp(self, pkt: Packet) -> None:
         body = _parse_json(pkt.payload)
+        ret = body.get("Ret")
         items = body.get("OPFileQuery") or []
         channel = getattr(self, "_file_query_channel", 1)
-        records = []
+        event = self._file_query_current_event or "*"
+        event_type = _FILE_EVENT_TYPE.get(event, "normal")
+
+        added = 0
         for it in items:
-            if isinstance(it, dict):
-                rec = FileRecord.from_dict(channel, it)
-                if rec is not None:
-                    records.append(rec)
-        log.info("[PB] query ch=%d -> %d files", channel, len(records))
-        self.fileList.emit(records)
+            if not isinstance(it, dict):
+                continue
+            rec = FileRecord.from_dict(channel, it, event_type=event_type)
+            if rec is None:
+                continue
+            key = (rec.file_name, rec.begin.strftime("%Y-%m-%d %H:%M:%S"))
+            prev = self._file_query_accumulator.get(key)
+            # [FIX arch] If the same file came under both "*" and a specific
+            # event filter, prefer the more specific event tag so the UI marks
+            # it correctly.
+            if prev is None or (prev.event_type == "normal" and event_type != "normal"):
+                self._file_query_accumulator[key] = rec
+                added += 1
+
+        if not items:
+            log.warning(
+                "[FIX arch] empty file-query ch=%d event=%s Ret=%s",
+                channel, event, ret,
+            )
+        else:
+            log.info(
+                "[FIX arch] file-query ch=%d event=%s -> %d items (added=%d, Ret=%s)",
+                channel, event, len(items), added, ret,
+            )
+
+        if self._file_query_queue:
+            self._send_next_file_query()
+            return
+
+        # Queue drained — emit the aggregated, deduped list sorted by start time.
+        merged = sorted(self._file_query_accumulator.values(), key=lambda r: r.begin)
+        log.info(
+            "[FIX arch] file-query ch=%d aggregated %d unique records",
+            channel, len(merged),
+        )
+        self._file_query_current_event = None
+        self._file_query_accumulator = {}
+        self.fileList.emit(merged)
 
     # ----- helpers ------------------------------------------------------
 
     def _sid_str(self) -> str:
         return f"0x{self._session_id:08x}"
+
+
+# [FIX arch] Map Sofia Event-filter value -> high-level record category used
+# by the UI to colour the entry in the archive list.
+_FILE_EVENT_TYPE: dict[str, str] = {
+    "*": "normal",
+    "A": "alarm",
+    "M": "motion",
+    "H": "human",
+}
 
 
 @dataclass(slots=True)
@@ -541,9 +670,17 @@ class FileRecord:
     file_name: str
     size: int = 0
     disk: int = 0
+    # [FIX arch] One of: "normal" / "motion" / "alarm" / "human". Set from the
+    # Event filter that produced the record so the UI can color-code it.
+    event_type: str = "normal"
 
     @classmethod
-    def from_dict(cls, channel: int, d: dict) -> "FileRecord | None":
+    def from_dict(
+        cls,
+        channel: int,
+        d: dict,
+        event_type: str = "normal",
+    ) -> "FileRecord | None":
         try:
             begin = datetime.strptime(d["BeginTime"], "%Y-%m-%d %H:%M:%S")
             end = datetime.strptime(d["EndTime"], "%Y-%m-%d %H:%M:%S")
@@ -561,6 +698,7 @@ class FileRecord:
             file_name=str(d.get("FileName", "")),
             size=size,
             disk=int(d.get("DiskNo", 0) or 0),
+            event_type=event_type,
         )
 
 
