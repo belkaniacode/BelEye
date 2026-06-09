@@ -156,7 +156,15 @@ class PlaybackView(QWidget):
         self.calendar = QCalendarWidget()
         self.calendar.setGridVisible(True)
         self.calendar.selectionChanged.connect(self._on_day_selected)
-        self.calendar.currentPageChanged.connect(lambda y, m: self._load_month(y, m))
+        # [C3] currentPageChanged fires when the user clicks the < / > arrows
+        # AND when we programmatically jump (we block signals around those).
+        self.calendar.currentPageChanged.connect(self._on_page_changed)
+        # [C2/C3] Calendar nav fallback state.
+        self._max_fallback_months = 6
+        self._fallback_remaining = 0
+        # Track the most-recent year/month known to contain data so we can
+        # clamp forward navigation past it (calendars beyond hold no recs).
+        self._latest_data_month: tuple[int, int] | None = None
 
         self.file_list = QListWidget()
         self.file_list.itemDoubleClicked.connect(self._on_file_activated)
@@ -186,6 +194,13 @@ class PlaybackView(QWidget):
         self.btn_export = QPushButton("Экспорт…")
         self.btn_export.setCursor(Qt.PointingHandCursor)
         self.btn_export.clicked.connect(self._on_export)
+        # [D2] Always-visible Close button. The native window decoration is
+        # easy to miss on some WMs, and during debugging "the window is
+        # stuck" makes Stop+close-by-X feel painful.
+        self.btn_close = QPushButton("× Закрыть")
+        self.btn_close.setCursor(Qt.PointingHandCursor)
+        self.btn_close.setToolTip("Закрыть окно архива (Esc)")
+        self.btn_close.clicked.connect(self.close)
         self._status = QLabel("Выберите запись в списке или кликните по таймлайну.")
         self._status.setStyleSheet("color: #94a3b8;")
 
@@ -195,6 +210,7 @@ class PlaybackView(QWidget):
         transport.addWidget(self.btn_speed)
         transport.addStretch(1)
         transport.addWidget(self.btn_export)
+        transport.addWidget(self.btn_close)
 
         self.timeline = _DayTimeline()
         self.timeline.seekRequested.connect(self._on_timeline_seek)
@@ -249,7 +265,11 @@ class PlaybackView(QWidget):
     # ----- session / queries -------------------------------------------
 
     def _on_login(self, _sid: int) -> None:
+        # [C2] Initial month load with a budget of fallbacks: try the
+        # currently-shown month first, and if it comes back empty roll back
+        # one month at a time up to ``_max_fallback_months`` to find data.
         d = self.calendar.selectedDate()
+        self._fallback_remaining = self._max_fallback_months
         self._load_month(d.year(), d.month())
 
     def _load_month(self, year: int, month: int) -> None:
@@ -260,18 +280,73 @@ class PlaybackView(QWidget):
         last = nxt - timedelta(seconds=1)
         self._loading_scope = "month"
         self._set_status(f"Загрузка записей за {year}-{month:02d}…")
+        # [FIX cap] DvripClient.query_files chunks under the 64-record cap.
         self._client.query_files(self.channel_number, first, last)
+
+    def _on_page_changed(self, year: int, month: int) -> None:
+        """User flipped the calendar page (< / >) OR we did programmatically.
+
+        [C3] Clamp navigation past the latest-known data month. The user can
+        still navigate freely backwards (history exploration), but jumping
+        into the future just lands on empty calendars — confusing, so we
+        snap back to the latest known month.
+        """
+        latest = self._latest_data_month
+        if latest is not None and (year, month) > latest:
+            log.info(
+                "[C3] clamping calendar nav (%04d-%02d) -> latest data month %04d-%02d",
+                year, month, latest[0], latest[1],
+            )
+            self.calendar.blockSignals(True)
+            try:
+                self.calendar.setCurrentPage(latest[0], latest[1])
+            finally:
+                self.calendar.blockSignals(False)
+            return
+        # Manual user nav resets the fallback budget — they want to see THIS
+        # month, not be silently redirected.
+        self._fallback_remaining = 0
+        self._load_month(year, month)
+
+    def _update_latest_data_month(self) -> None:
+        if not self._month_records:
+            return
+        latest_day = max(r.begin.date() for r in self._month_records)
+        candidate = (latest_day.year, latest_day.month)
+        if self._latest_data_month is None or candidate > self._latest_data_month:
+            self._latest_data_month = candidate
+            log.info("[C3] latest data month is now %04d-%02d", *candidate)
 
     def _on_file_list(self, records: list) -> None:
         if self._loading_scope == "month":
             self._month_records = records
+            # [C2] Auto-fallback to the previous month when the current
+            # month has no data — typical for NVRs early in the month
+            # while last month still has the bulk of recordings.
+            if not records and self._fallback_remaining > 0:
+                self._fallback_remaining -= 1
+                cur = self.calendar.selectedDate()
+                year = cur.year()
+                month = cur.month() - 1
+                if month < 1:
+                    month = 12
+                    year -= 1
+                target = QDate(year, month, 1)
+                log.info("[C2] empty month, falling back to %04d-%02d", year, month)
+                self.calendar.blockSignals(True)
+                try:
+                    self.calendar.setCurrentPage(year, month)
+                    self.calendar.setSelectedDate(target)
+                finally:
+                    self.calendar.blockSignals(False)
+                self._load_month(year, month)
+                return
             self._highlight_days()
-            # [FIX uxbug] After loading the month, jump to the day that
-            # actually has data. Otherwise the user lands on "today" which —
-            # if the NVR has overwritten that range — looks identical to
-            # "the feature is broken". Empty calendar+empty list was the
-            # original confusion in screenshot 20260608_224544.
             self._auto_select_latest_day_with_records()
+            # [C3] Now that we know which months have data, clamp forward nav
+            # so the user can't accidentally jump into the future and see
+            # an empty calendar.
+            self._update_latest_data_month()
             self._refresh_day()
         else:
             self._day_records = records
@@ -487,6 +562,12 @@ class PlaybackView(QWidget):
             "[FIX codec] PB codec=%s, starting decoder (buffered %d B)",
             codec, len(buffered),
         )
+        # [B2 audit] Dump the buffered first-frame elementary stream to disk
+        # AND render a thumbnail (best-effort). The OSD watermark on the
+        # thumbnail proves the playback came from the channel the user
+        # actually clicked, not from CAM01. Path is greppable in the log
+        # for field diagnostics.
+        self._audit_first_frame(buffered, codec)
         self.player.set_input_codec(codec)
         self.player.start()
         self.player.feed_bytes(buffered)
@@ -494,6 +575,36 @@ class PlaybackView(QWidget):
             if self._exporter.start(self._exporter_out_path, codec):
                 self._exporter.feed_bytes(buffered)
         self._codec_detected = True
+
+    def _audit_first_frame(self, buffered: bytes, codec: str) -> None:
+        """Persist first-frame ES + thumbnail under /tmp so the operator can
+        confirm visually that the playback actually serves the requested
+        channel. Best-effort: logs the path and any ffmpeg failure but never
+        raises into the streaming path."""
+        import os
+        import shutil
+        import subprocess
+        try:
+            stem = f"/tmp/beleye_audit_pb_ch{self.channel_number}_first"
+            bin_path = f"{stem}.bin"
+            png_path = f"{stem}.png"
+            with open(bin_path, "wb") as f:
+                f.write(buffered)
+            ffmpeg = shutil.which("ffmpeg")
+            if ffmpeg:
+                subprocess.run(
+                    [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                     "-f", codec, "-i", bin_path, "-frames:v", "1",
+                     "-vf", "scale=480:-2", png_path],
+                    capture_output=True, timeout=6,
+                )
+            ok = os.path.exists(png_path) and os.path.getsize(png_path) > 1024
+            log.info(
+                "[FIX channel] PB first-frame audit ch=%d bin=%s png=%s ok=%s",
+                self.channel_number, bin_path, png_path, ok,
+            )
+        except Exception:
+            log.exception("[FIX channel] first-frame audit failed (non-fatal)")
 
     def _on_play_pause(self) -> None:
         self._start_playback(self._selected_record())
@@ -578,7 +689,18 @@ class PlaybackView(QWidget):
         super().keyPressEvent(event)
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        # [B3] Send an explicit OPPlayBack Stop BEFORE closing the socket so
+        # the firmware frees the playback slot — re-opening the window
+        # immediately after a close used to race a stale claim and get
+        # Ret=103 back. Also cancel any pending restart timer.
         try:
+            self._restart_timer.stop()
+            self._restart_pending = None
+            if self._client is not None:
+                try:
+                    self._client.stop_playback()
+                except Exception:
+                    log.exception("[B3] stop_playback in closeEvent failed")
             self.player.stop()
             if self._client:
                 self._client.close()

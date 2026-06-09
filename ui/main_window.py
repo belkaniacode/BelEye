@@ -333,6 +333,25 @@ class MainWindow(QMainWindow):
         ch_name = ch.name if ch else f"CH{channel_number:02d}"
         password = keystore.get_password(nvr_keyring_user(nvr.id))
         log.info("[FIX archive] menu open nvr=%s ch=%d", nvr.name, channel_number)
+        # [D1] Session budget — this Xiongmai HVR appears to revoke claims
+        # silently after ~6 active sessions. Live tiles + control client +
+        # any open PlaybackView all consume one. Warn the user before they
+        # accumulate a backlog they can't recover from without restarting
+        # the NVR.
+        try:
+            live_tiles = sum(
+                1 for tid in self.grid._tiles.keys() if tid.startswith("nvr:")
+            )
+        except Exception:
+            live_tiles = 0
+        active = live_tiles + len(self._nvr_control) + len(self._playback_windows)
+        if active >= 6:
+            log.warning(
+                "[D1] NVR session budget at %d (live tiles=%d, control=%d, archives=%d) — "
+                "next playback claim may be rejected with Ret=103; "
+                "close older archive windows first",
+                active, live_tiles, len(self._nvr_control), len(self._playback_windows),
+            )
         try:
             view = PlaybackView(nvr, channel_number, ch_name, password, parent=None)
         except Exception:
