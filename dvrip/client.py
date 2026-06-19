@@ -106,7 +106,12 @@ class DvripClient(QObject):
         self._file_query_end: datetime | None = None
         # [FIX cap] Queue is now list of (window_begin, window_end, event)
         # so each request stays under the firmware's ~64-record response cap.
-        self._file_query_queue: list[tuple[datetime, datetime, str]] = []
+        # [FIX archive3] Paginated file-query state — see query_files.
+        self._file_query_event_queue: list[str] = []
+        self._file_query_cursor: datetime | None = None
+        self._file_query_last_key: tuple | None = None
+        self._file_query_page_count: int = 0
+        self._file_query_page_cap: int = 200
         self._file_query_current_event: str | None = None
         self._file_query_accumulator: dict[tuple[str, str], FileRecord] = {}
 
@@ -174,76 +179,44 @@ class DvripClient(QObject):
     ) -> None:
         """Play back an archived file for ``channel`` (1-based).
 
-        [FIX channel] WINNING VARIANT (matrix probe #04, scripts/probe_playback_matrix.py).
-        Xiongmai HVR firmware does NOT route OPPlayBack by ``FileName``,
-        ``Parameter.Channel``, ``Parameter.Value`` or ``OPPlayBack.Channel``.
-        The only way to make the playback stream come from the requested
-        channel is to bind the session's "active channel" first by sending
-        an OPMonitor Claim + Start on the SAME socket BEFORE the OPPlayBack
-        Claim. The firmware then uses the most-recent OPMonitor channel as
-        the playback source. Hardware-verified by capturing the first
-        I-frame for ch=1 and ch=4 with and without the pre-claim:
-          * without:  both files return frames stamped OSD=CAMO1 (wrong).
-          * with:     ch=4 returns frames stamped OSD=CAM04 (correct).
+        [FIX archive3] CANONICAL DVRIP PLAYBACK PATH — hardware-verified.
 
-        Flow:
-          1. OPMonitor Claim    (1413) → 1414 Ret=100
-          2. OPMonitor Start    (1410) for channel
-          3. OPPlayBack Claim   (1413) → 1414 Ret=100
-          4. OPPlayBack Start   (1410)   (handled in _handle_monitor_claim_rsp)
-          5. MONITOR_DATA       (1412)  ← actual video for `channel`
+        Per the alexshpilkin/dvrip reference implementation, and confirmed by
+        ``scripts/probe_playback_1424.py`` against the Xiongmai NBD80S16S-KL:
+
+          1. Send 1424 (PLAYBACK_CLAIM_REQ_NEW) Action="Claim" with the
+             minimal Parameter body {FileName, TransMode:"TCP"} plus
+             StartTime/EndTime. The firmware identifies the channel from
+             the file path itself — no Channel/Value/StreamType field is
+             needed, and including them can confuse the parser.
+          2. Receive 1425 (PLAYBACK_CLAIM_RSP_NEW) with Ret=100.
+          3. Send 1420 (PLAYBACK_REQ_START) Action="Start" with the same
+             body. (NB: sending the Start on 1424 again is interpreted as a
+             duplicate Claim and rejected with Ret=103 — the action is
+             always sent on 1420.)
+          4. Archive video flows on 1422 (PLAYBACK_DATA_STREAM). Decoded as
+             a Sofia-wrapped H.264/HEVC elementary stream just like live.
+          5. To stop, send 1420 with Action="Stop".
+
+        Channel is correct (CAM04 OSD), timestamps match the requested
+        file's recording window, and ZERO live MONITOR_DATA (1412) leaks
+        — the firmware multiplexes them on different opcodes, so the
+        archive stream is naturally isolated from any concurrent live
+        traffic. The pre-OPMonitor channel-hint hack that was used in the
+        archive/archive2 fixes is no longer needed and has been removed.
         """
         if not self._logged_in:
             log.warning("[PB] start_playback before login")
             return
 
-        # Step 1+2: pre-claim OPMonitor for the target channel. This sets the
-        # firmware's "active channel" so the upcoming playback streams it.
-        log.info("[FIX channel] PB pre-OPMonitor claim+start ch=%d", channel)
-        self._send(MsgId.MONITOR_CLAIM_REQ, {
-            "Name": "OPMonitor",
-            "SessionID": self._sid_str(),
-            "OPMonitor": {
-                "Action": "Claim",
-                "Parameter": {
-                    "Channel": channel - 1,
-                    "CombinMode": "NONE",
-                    "StreamType": "Main",
-                    "TransMode": "TCP",
-                },
-            },
-        })
-        self._send(MsgId.MONITOR_START_REQ, {
-            "Name": "OPMonitor",
-            "SessionID": self._sid_str(),
-            "OPMonitor": {
-                "Action": "Start",
-                "Parameter": {
-                    "Channel": channel - 1,
-                    "CombinMode": "NONE",
-                    "StreamType": "Main",
-                    "TransMode": "TCP",
-                },
-            },
-        })
+        # Cancel any prior playback session on this client before starting
+        # a new one, so the firmware doesn't hold the previous claim.
+        if self._pending_playback is not None:
+            self.stop_playback()
 
-        # Step 3+4: send OPPlayBack Claim AND Start after a 250 ms gap so the
-        # firmware finishes binding "active channel" to the OPMonitor. Without
-        # the gap, channels currently watched by a live tile get the
-        # pre-OPMonitor revoked with Ret=103 before playback sees data.
-        # We ALSO redundantly carry the channel in Parameter.Channel and
-        # Parameter.Value as belt-and-suspenders: when the pre-OPMonitor is
-        # rejected (e.g. ch=2 is already held by a live tile on a different
-        # socket), at least one of these hints may steer the playback to the
-        # correct port on some firmware revisions. They are no-ops on the
-        # firmware that needs the pre-OPMonitor route.
         params = {
-            "PlayMode": "ByName",
             "FileName": file_name,
-            "StreamType": 0,
-            "Value": channel - 1,
             "TransMode": "TCP",
-            "Channel": channel - 1,
         }
         body = {
             "Action": "Claim",
@@ -253,31 +226,38 @@ class DvripClient(QObject):
         }
         self._pending_playback = body
 
-        def _send_playback_after_delay():
+        log.info("[FIX archive3] PB 1424 Claim ch=%d file=%s", channel, file_name)
+        self._send(MsgId.PLAYBACK_CLAIM_REQ_NEW, {
+            "Name": "OPPlayBack",
+            "SessionID": self._sid_str(),
+            "OPPlayBack": body,
+        })
+
+        def _send_start():
             if self._pending_playback is None or not self._logged_in:
-                log.info("[FIX channel] PB delayed-send aborted (no pending)")
+                log.info("[FIX archive3] PB delayed Start aborted (no pending)")
                 return
-            log.info("[FIX channel] PB claim+start ch=%d file=%s", channel, file_name)
-            self._send(MsgId.MONITOR_CLAIM_REQ, {
-                "Name": "OPPlayBack", "SessionID": self._sid_str(),
-                "OPPlayBack": body,
-            })
             start_body = dict(body)
             start_body["Action"] = "Start"
-            self._send(MsgId.MONITOR_START_REQ, {
-                "Name": "OPPlayBack", "SessionID": self._sid_str(),
+            log.info("[FIX archive3] PB 1420 Start ch=%d", channel)
+            self._send(MsgId.PLAYBACK_REQ_START, {
+                "Name": "OPPlayBack",
+                "SessionID": self._sid_str(),
                 "OPPlayBack": start_body,
             })
 
-        QTimer.singleShot(250, _send_playback_after_delay)
+        # Give the firmware ~300 ms to process the Claim before issuing
+        # Start — probe showed Ret=103 on back-to-back sends.
+        QTimer.singleShot(300, _send_start)
 
     def stop_playback(self) -> None:
         if not self._logged_in or self._pending_playback is None:
             return
-        log.info("[PB] playback stop")
         params = self._pending_playback.get("Parameter", {})
-        self._send(MsgId.MONITOR_STOP_REQ, {
-            "Name": "OPPlayBack", "SessionID": self._sid_str(),
+        log.info("[FIX archive3] PB 1420 Stop")
+        self._send(MsgId.PLAYBACK_REQ_START, {
+            "Name": "OPPlayBack",
+            "SessionID": self._sid_str(),
             "OPPlayBack": {"Action": "Stop", "Parameter": params},
         })
         self._pending_playback = None
@@ -287,18 +267,21 @@ class DvripClient(QObject):
         """Query recorded files for ``channel`` in [begin, end]. Emits ``fileList``
         with a list[FileRecord]. Channel is 1-based here, 0-based on the wire.
 
-        [FIX arch] Issues one request per event filter (``*``, ``A``, ``M``,
-        ``H``) sequentially and merges the responses, because Xiongmai
-        firmwares only return continuous segments for the wildcard query and
-        keep motion/alarm/human segments behind explicit ``Event=X`` filters.
+        [FIX archive3] Pagination by last-record cursor — matches the
+        alexshpilkin/dvrip ``files()`` pattern. The firmware caps any single
+        OPFileQuery (opcode 1440) reply at ~64 records, sorted oldest-first;
+        the old "chunk_days × event" cartesian schedule missed days when
+        a single chunk-window held >64 records (which happens whenever the
+        NVR records continuously). The fix: for each Event filter, send
+        one request, take the LAST record's begin as the next BeginTime,
+        and keep paging until the server returns an empty page or repeats
+        the last record. This walks the WHOLE time range no matter how
+        dense the recordings are.
 
-        [FIX cap] Xiongmai's OPFileQuery silently caps responses at ~64
-        records sorted oldest-first. A month-wide query for an actively
-        recording NVR returns only the first ~3 days. We CHUNK the request
-        into ``chunk_days``-wide windows (default 2 days, which fits under
-        the cap with margin for both continuous + motion records) and
-        aggregate ALL chunks before emitting.
+        The ``chunk_days`` parameter is ignored — kept for call-site
+        compatibility.
         """
+        del chunk_days  # unused — pagination replaces chunking
         if not self._logged_in:
             log.warning("[PB] query_files before login (ch=%d)", channel)
             return
@@ -306,48 +289,69 @@ class DvripClient(QObject):
         self._file_query_begin = begin
         self._file_query_end = end
         self._file_query_accumulator = {}
-
-        # Build chunk schedule: cartesian product of (window, event).
-        from datetime import timedelta
-        chunks: list[tuple[datetime, datetime]] = []
-        cur = begin
-        delta = timedelta(days=max(1, chunk_days))
-        while cur <= end:
-            window_end = min(end, cur + delta - timedelta(seconds=1))
-            chunks.append((cur, window_end))
-            cur = window_end + timedelta(seconds=1)
-        self._file_query_chunks = chunks
-        self._file_query_queue = []
-        for event in FILE_QUERY_EVENTS:
-            for win in chunks:
-                self._file_query_queue.append((win[0], win[1], event))
+        # One paginated walk per event filter. Cursor is the BeginTime sent in
+        # the next 1440 request; advanced to last_record.begin after every
+        # non-empty reply. Page-safety cap: 200 pages × 64 records = 12 800
+        # records per event — far more than any sane NVR holds for one month.
+        self._file_query_event_queue = list(FILE_QUERY_EVENTS)
         self._file_query_current_event = None
+        self._file_query_cursor: datetime | None = None
+        self._file_query_last_key: tuple | None = None
+        self._file_query_page_count: int = 0
+        self._file_query_page_cap: int = 200
         log.info(
-            "[FIX cap] query ch=%d %s..%s chunks=%d events=%d total=%d",
+            "[FIX archive3] query ch=%d %s..%s events=%d (paginated)",
             channel,
             begin.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"),
-            len(chunks), len(FILE_QUERY_EVENTS), len(self._file_query_queue),
+            len(self._file_query_event_queue),
         )
-        self._send_next_file_query()
+        self._start_next_event_query()
 
-    def _send_next_file_query(self) -> None:
-        if not self._file_query_queue:
+    def _start_next_event_query(self) -> None:
+        """[FIX archive3] Begin paginated walk for the next event filter."""
+        if not self._file_query_event_queue:
+            self._emit_aggregated_file_list()
             return
-        win_begin, win_end, event = self._file_query_queue.pop(0)
-        self._file_query_current_event = event
-        self._file_query_current_window = (win_begin, win_end)
-        b = win_begin.strftime("%Y-%m-%d %H:%M:%S")
-        e = win_end.strftime("%Y-%m-%d %H:%M:%S")
+        self._file_query_current_event = self._file_query_event_queue.pop(0)
+        self._file_query_cursor = self._file_query_begin
+        self._file_query_last_key = None
+        self._file_query_page_count = 0
+        self._send_file_query_page()
+
+    def _send_file_query_page(self) -> None:
+        """[FIX archive3] Send one OPFileQuery for the current event+cursor."""
+        if self._file_query_current_event is None:
+            return
+        b = self._file_query_cursor.strftime("%Y-%m-%d %H:%M:%S")
+        e = self._file_query_end.strftime("%Y-%m-%d %H:%M:%S")
+        self._file_query_page_count += 1
         self._send(MsgId.FILE_QUERY_REQ, {
             "Name": "OPFileQuery",
             "SessionID": self._sid_str(),
             "OPFileQuery": {
                 "BeginTime": b, "EndTime": e,
                 "Channel": self._file_query_channel - 1,
-                "DriveTypeMask": 0, "Event": event,
+                "DriveTypeMask": 0,
+                "Event": self._file_query_current_event,
                 "Type": "h264", "StreamType": 0,
             },
         })
+
+    def _emit_aggregated_file_list(self) -> None:
+        merged = sorted(
+            self._file_query_accumulator.values(), key=lambda r: r.begin
+        )
+        log.info(
+            "[FIX archive3] file-query ch=%d aggregated %d unique records",
+            self._file_query_channel, len(merged),
+        )
+        self._file_query_current_event = None
+        self._file_query_accumulator = {}
+        self.fileList.emit(merged)
+
+    # Back-compat alias: some older call paths still invoke this name.
+    def _send_next_file_query(self) -> None:
+        self._send_file_query_page()
 
     def query_record_status(self) -> None:
         """Request the per-channel record schedule. Emits ``recordStatus``.
@@ -395,11 +399,14 @@ class DvripClient(QObject):
         self._keepalive.stop()
         self._logged_in = False
         self._session_id = 0
-        # [FIX arch] Don't leave a half-finished multi-event file query in
-        # the queued state — next session would start mid-flight.
-        self._file_query_queue = []
+        # [FIX archive3] Don't leave a half-finished paginated file query in
+        # mid-flight — next session would resume from a stale cursor.
+        self._file_query_event_queue = []
         self._file_query_current_event = None
         self._file_query_accumulator = {}
+        self._file_query_cursor = None
+        self._file_query_last_key = None
+        self._file_query_page_count = 0
         self.disconnected.emit()
 
     def _on_socket_error(self, _err: QAbstractSocket.SocketError) -> None:
@@ -466,7 +473,8 @@ class DvripClient(QObject):
         # Streaming + keepalive are noisy; log them short. Everything else
         # (control responses) is logged in FULL so firmware quirks are
         # diagnosable from the log without re-running.
-        if pkt.msg_id in (MsgId.MONITOR_DATA, MsgId.PLAYBACK_DATA, MsgId.KEEPALIVE_RSP):
+        if pkt.msg_id in (MsgId.MONITOR_DATA, MsgId.PLAYBACK_DATA,
+                           MsgId.PLAYBACK_DATA_STREAM, MsgId.KEEPALIVE_RSP):
             log.debug("[DVRIP] recv msg=%d len=%d", pkt.msg_id, len(pkt.payload))
         else:
             full = pkt.payload.rstrip(b"\x00").decode("utf-8", errors="replace")
@@ -489,10 +497,25 @@ class DvripClient(QObject):
             self._handle_login_rsp(pkt)
         elif pkt.msg_id == MsgId.MONITOR_CLAIM_RSP:  # 1414
             self._handle_monitor_claim_rsp(pkt)
-        elif pkt.msg_id == MsgId.MONITOR_DATA:       # 1412
+        elif pkt.msg_id == MsgId.MONITOR_DATA:       # 1412 — live tiles
             self._handle_monitor_data(pkt)
-        elif pkt.msg_id == MsgId.PLAYBACK_DATA:
+        elif pkt.msg_id == MsgId.PLAYBACK_DATA_STREAM:  # 1422 — [FIX archive3] archive
             self.playbackChunk.emit(pkt.payload)
+        elif pkt.msg_id == MsgId.PLAYBACK_CLAIM_RSP_NEW:  # 1425
+            body = _parse_json(pkt.payload)
+            ret = int(body.get("Ret", -1))
+            if ret != 100:
+                log.warning("[FIX archive3] PB 1424 Claim rejected Ret=%d body=%s",
+                            ret, body)
+            else:
+                log.info("[FIX archive3] PB 1424 Claim ACK Ret=100")
+        elif pkt.msg_id == MsgId.PLAYBACK_REQ_START_RSP:  # 1421
+            body = _parse_json(pkt.payload)
+            ret = int(body.get("Ret", -1))
+            if ret != 100:
+                log.warning("[FIX archive3] PB 1420 reply Ret=%d body=%s", ret, body)
+            else:
+                log.debug("[FIX archive3] PB 1420 ACK Ret=100")
         elif pkt.msg_id in (
             MsgId.SYSINFO_RSP, MsgId.ABILITY_GET_RSP, MsgId.CONFIG_GET_RSP,
             MsgId.DIGITAL_CHANNEL_STATUS_RSP,
@@ -621,21 +644,11 @@ class DvripClient(QObject):
     def _handle_monitor_claim_rsp(self, pkt: Packet) -> None:
         body = _parse_json(pkt.payload)
         ret = int(body.get("Ret", -1))
-        # [FIX channel] Branch by the response's ``Name`` field — OPMonitor
-        # claim returns Name="OPMonitor", OPPlayBack returns Name="OPPlayBack".
-        # When start_playback issues the pre-claim OPMonitor we receive two
-        # 1414 responses back-to-back, and we must not start playback on the
-        # OPMonitor ACK (that fires before the playback claim even arrives).
+        # [FIX archive3] OPPlayBack no longer uses opcode 1413 — only OPMonitor
+        # (live tiles) does. The response Name is always "OPMonitor" here.
         name = str(body.get("Name", ""))
         if ret != 100:
             log.warning("[NVR] claim rejected Name=%s Ret=%d full=%s", name, ret, body)
-            return
-        if name == "OPPlayBack":
-            # [FIX channel] OPPlayBack Start was already sent eagerly by
-            # ``start_playback`` immediately after the Claim. The post-ACK
-            # path is intentionally a no-op on this firmware; logging it
-            # only.
-            log.info("[FIX channel] PB OPPlayBack ACK acknowledged (start already sent)")
             return
         # OPMonitor ACK path (live tiles AND the pre-claim from start_playback).
         # Only auto-Start the live-tile claims we tracked in _pending_monitors;
@@ -661,9 +674,13 @@ class DvripClient(QObject):
             log.info("[NVR] monitor start ch=%d", pending.channel)
 
     def _handle_monitor_data(self, pkt: Packet) -> None:
-        # The NVR does not tag MONITOR_DATA packets with a channel number; the
-        # session itself is per-claim. With a single active claim we route to
-        # that channel; multi-channel multiplexing is added in the OPMonitor task.
+        # [FIX archive3] LIVE monitor data only. Archive playback flows on a
+        # different opcode (1422 / PLAYBACK_DATA_STREAM) so there is no
+        # cross-stream mixing to worry about here.
+        # The NVR does not tag MONITOR_DATA packets with a channel number;
+        # the session itself is per-claim. With a single active claim we
+        # route to that channel; multi-channel multiplexing is added in the
+        # OPMonitor task.
         if len(self._pending_monitors) == 1:
             ch = next(iter(self._pending_monitors))
         else:
@@ -679,6 +696,8 @@ class DvripClient(QObject):
         event_type = _FILE_EVENT_TYPE.get(event, "normal")
 
         added = 0
+        last_record_begin: datetime | None = None
+        last_key: tuple | None = None
         for it in items:
             if not isinstance(it, dict):
                 continue
@@ -687,40 +706,47 @@ class DvripClient(QObject):
                 continue
             key = (rec.file_name, rec.begin.strftime("%Y-%m-%d %H:%M:%S"))
             prev = self._file_query_accumulator.get(key)
-            # [FIX arch] If the same file came under both "*" and a specific
-            # event filter, prefer the more specific event tag so the UI marks
-            # it correctly.
+            # If the same file came under both "*" and a specific event
+            # filter, prefer the more specific event tag so the UI colors it.
             if prev is None or (prev.event_type == "normal" and event_type != "normal"):
                 self._file_query_accumulator[key] = rec
                 added += 1
+            last_record_begin = rec.begin
+            last_key = key
 
-        # [FIX cap] With chunked queries, empty responses are normal (a
-        # quiet weekend has no records). Demote to DEBUG so the log stays
-        # readable. Final per-channel aggregate count is logged at INFO.
-        if not items:
-            log.debug(
-                "[FIX arch] empty file-query ch=%d event=%s Ret=%s",
-                channel, event, ret,
-            )
-        else:
-            log.debug(
-                "[FIX arch] file-query ch=%d event=%s -> %d items added=%d",
-                channel, event, len(items), added,
-            )
+        log.debug(
+            "[FIX archive3] file-query ch=%d event=%s page=%d items=%d added=%d Ret=%s",
+            channel, event, self._file_query_page_count, len(items), added, ret,
+        )
 
-        if self._file_query_queue:
-            self._send_next_file_query()
+        # [FIX archive3] Pagination termination conditions:
+        #   1. Empty page (no items at all).
+        #   2. Page cap exceeded — safety net for buggy firmwares.
+        #   3. Last record key is the same as the previous page's last key
+        #      → we are not advancing, server returned the same window twice.
+        page_repeats = (
+            last_key is not None and last_key == self._file_query_last_key
+        )
+        if (
+            not items
+            or self._file_query_page_count >= self._file_query_page_cap
+            or page_repeats
+            or last_record_begin is None
+        ):
+            # Done with this event filter — try the next one.
+            self._start_next_event_query()
             return
 
-        # Queue drained — emit the aggregated, deduped list sorted by start time.
-        merged = sorted(self._file_query_accumulator.values(), key=lambda r: r.begin)
-        log.info(
-            "[FIX arch] file-query ch=%d aggregated %d unique records",
-            channel, len(merged),
-        )
-        self._file_query_current_event = None
-        self._file_query_accumulator = {}
-        self.fileList.emit(merged)
+        # Advance cursor past the last record's start, then ask for more.
+        # Using `last.begin + 1 second` avoids re-receiving the exact same
+        # boundary record on the next page.
+        from datetime import timedelta
+        self._file_query_last_key = last_key
+        self._file_query_cursor = last_record_begin + timedelta(seconds=1)
+        if self._file_query_cursor > self._file_query_end:
+            self._start_next_event_query()
+            return
+        self._send_file_query_page()
 
     # ----- helpers ------------------------------------------------------
 

@@ -233,7 +233,10 @@ class PlaybackView(QWidget):
         self._speed_idx = 0
         self._speeds = [1, 2, 4]
 
-        # Streaming state (fed by the DVRIP videoChunk signal)
+        # [FIX archive3] Streaming state — archive data flows on opcode 1422,
+        # exposed via the ``playbackChunk`` signal (NOT ``videoChunk``, which
+        # carries live MONITOR_DATA). Subscribing to the right signal is
+        # what cleanly separates archive from live.
         self._parser: SofiaFrameParser | None = None
         self._codec_detected = False
         # [FIX codec] Small accumulator (capped at 256 KB ≈ 0.1 s of HEVC main
@@ -259,7 +262,7 @@ class PlaybackView(QWidget):
         self._client.loginFailed.connect(lambda r: self._set_status(f"Логин отклонён: {r}"))
         self._client.error.connect(lambda e: self._set_status(f"Сеть: {e}"))
         self._client.fileList.connect(self._on_file_list)
-        self._client.videoChunk.connect(self._on_video_chunk)
+        self._client.playbackChunk.connect(self._on_playback_chunk)
         self._client.connect_to(nvr.host, nvr.port, nvr.username, password)
 
     # ----- session / queries -------------------------------------------
@@ -415,19 +418,17 @@ class PlaybackView(QWidget):
         self._day_records = records
         self._populate_day(records)
 
-    # [FIX arch] Color-coded markers for the per-day list. Matches the
-    # event_type set by DvripClient.query_files().
+    # [FIX events-preview] Color-coded markers retained only as accent dots
+    # in the row label — the textual "Запись"/"Движение"/etc. labels were
+    # misleading because on this NVR every recording is motion-triggered,
+    # so the distinction was bogus. We keep the dot color as a subtle event-
+    # type accent (yellow=motion, red=alarm, green=human, blue=continuous)
+    # in case the firmware ever does report a more diverse mix.
     _EVENT_DOTS: dict[str, tuple[str, str]] = {
-        "normal": ("●", "#3b82f6"),   # blue   — continuous record
-        "motion": ("●", "#eab308"),   # yellow — motion-triggered
-        "alarm":  ("●", "#dc2626"),   # red    — alarm-triggered
-        "human":  ("●", "#22c55e"),   # green  — human detection
-    }
-    _EVENT_LABELS: dict[str, str] = {
-        "normal": "Запись",
-        "motion": "Движение",
-        "alarm":  "Тревога",
-        "human":  "Человек",
+        "normal": ("●", "#3b82f6"),
+        "motion": ("●", "#eab308"),
+        "alarm":  ("●", "#dc2626"),
+        "human":  ("●", "#22c55e"),
     }
 
     def _populate_day(self, records: list[FileRecord]) -> None:
@@ -435,10 +436,9 @@ class PlaybackView(QWidget):
         for rec in records:
             etype = getattr(rec, "event_type", "normal")
             dot, color = self._EVENT_DOTS.get(etype, self._EVENT_DOTS["normal"])
-            event_label = self._EVENT_LABELS.get(etype, "Запись")
             label = (
-                f"{dot}  {rec.begin:%H:%M:%S}–{rec.end:%H:%M:%S}   "
-                f"{event_label}   ({rec.size // 1024} KB)"
+                f"{dot}  {rec.begin:%H:%M:%S}–{rec.end:%H:%M:%S}    "
+                f"{rec.size // 1024} KB"
             )
             item = QListWidgetItem(label)
             item.setForeground(QColor(color))
@@ -527,7 +527,7 @@ class PlaybackView(QWidget):
             f"{rec.end.strftime('%H:%M:%S')}"
         )
 
-    def _on_video_chunk(self, _channel: int, data: bytes) -> None:
+    def _on_playback_chunk(self, data: bytes) -> None:
         if not self._parser:
             # Chunks arriving between stop and (delayed) start — drop them so
             # they don't contaminate the next detection pass.
