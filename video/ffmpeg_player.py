@@ -92,13 +92,21 @@ class FFmpegPlayer(QWidget):
 
         # Subprocess state
         self._proc: Optional[QProcess] = None
-        self._stdout_buf: QByteArray = QByteArray()
+        # [FIX live-perf] bytearray + offset instead of QByteArray.remove() to
+        # avoid O(N) memmove per frame extraction. Under load 4 tiles each
+        # emit ~20fps × ~700 KB raw frames; the previous remove(0, frame_size)
+        # shifted the rest of the buffer per frame and caused visible UI lag
+        # and freezes when the OS pipe delivered multiple frames per stdout
+        # event. Compact only when the offset exceeds a threshold.
+        self._stdout_buf: bytearray = bytearray()
+        self._stdout_off: int = 0
         self._stderr_tail: list[str] = []
         self._in_output_section: bool = False
         self._width: int = 0
         self._height: int = 0
         self._frame_size: int = 0
         self._first_frame_seen: bool = False
+        self._fed_dropped_warned: bool = False
 
         # Widget chrome
         self.setAutoFillBackground(True)
@@ -156,7 +164,28 @@ class FFmpegPlayer(QWidget):
             return
         if self._proc is None or self._proc.state() != QProcess.Running:
             return
+        # [FIX live-perf] Backpressure: if ffmpeg is decode-bound, QProcess
+        # keeps queuing writes in an unbounded internal buffer and the
+        # process backs up arbitrarily — eventually starving the GUI thread
+        # via memory pressure. When the pending stdin queue exceeds 2 MB
+        # (≈1 s of NVR sub-stream), drop the incoming chunk and warn. The
+        # NVR will resend a keyframe soon enough to recover; better to skip
+        # frames than freeze the UI.
         try:
+            pending = self._proc.bytesToWrite()
+            if pending > 2 * 1024 * 1024:
+                if not self._fed_dropped_warned:
+                    log.warning(
+                        "[FIX live-perf] %s stdin backpressure %d B — "
+                        "dropping chunks until decoder catches up",
+                        self._safe_url(), pending,
+                    )
+                    self._fed_dropped_warned = True
+                return
+            if self._fed_dropped_warned and pending < 512 * 1024:
+                self._fed_dropped_warned = False
+                log.info("[FIX live-perf] %s stdin backpressure cleared",
+                         self._safe_url())
             self._proc.write(QByteArray(data))
         except Exception:
             log.exception("[player] feed_bytes failed")
@@ -177,18 +206,31 @@ class FFmpegPlayer(QWidget):
         log.info("[FIX] Spawning ffmpeg for %s", self._safe_url())
 
         # Reset per-attempt state
-        self._stdout_buf = QByteArray()
+        self._stdout_buf = bytearray()
+        self._stdout_off = 0
         self._stderr_tail = []
         self._in_output_section = False
         self._width = 0
         self._height = 0
         self._frame_size = 0
         self._first_frame_seen = False
+        self._fed_dropped_warned = False
 
         if self._input_mode == "pipe":
+            # [FIX live-perf] Tile-sized output (640 wide) and a hard
+            # 2-thread cap. With 4 live tiles the previous default (full
+            # ffmpeg auto-threads × 960-wide scale) thrashed the CPU and
+            # caused visible freezes. The Extra1 sub-stream the tiles use
+            # is already ≤640 wide on this NVR, so 'min(640,iw)' is a no-op
+            # on the common path but caps oversize main-stream tiles.
+            # Drop fps=20: the fps filter buffers frames to a fixed cadence
+            # which on a constrained pipe ADDS latency; let ffmpeg emit at
+            # the source rate and rely on `_on_stdout` collapsing bursts to
+            # the latest frame for paint.
             args = [
                 "-hide_banner",
                 "-loglevel", "info",
+                "-threads", "2",
                 # [FIX perf] Cut ffmpeg's default 5 s / 5 MB probe to a
                 # constant — pipe input gives us the codec up-front, so
                 # extra probing only adds startup latency. The combined
@@ -201,7 +243,7 @@ class FFmpegPlayer(QWidget):
                 "-f", self._input_codec,
                 "-i", "pipe:0",
                 "-an", "-sn",
-                "-vf", "scale='min(960,iw)':-2,fps=20",
+                "-vf", "scale='min(640,iw)':-2",
                 "-f", "rawvideo",
                 "-pix_fmt", "bgr24",
                 "pipe:1",
@@ -309,13 +351,22 @@ class FFmpegPlayer(QWidget):
         chunk = self._proc.readAllStandardOutput()
         if chunk.isEmpty():
             return
-        self._stdout_buf.append(chunk)
+        # [FIX live-perf] Append raw bytes to bytearray (amortised O(1));
+        # use an offset cursor for frame extraction so we never memmove the
+        # remaining buffer per frame. Compact only when the offset crosses
+        # a generous threshold (16 MB) — under steady-state the buffer
+        # holds at most ~1 frame so compaction is rare.
+        self._stdout_buf.extend(bytes(chunk))
         if self._frame_size <= 0:
             return  # not yet known; keep buffering
-        # Extract as many whole frames as we have
-        while self._stdout_buf.size() >= self._frame_size:
-            frame_bytes = bytes(self._stdout_buf.left(self._frame_size))
-            self._stdout_buf.remove(0, self._frame_size)
+        buf = self._stdout_buf
+        fs = self._frame_size
+        off = self._stdout_off
+        latest_frame: Optional[QImage] = None
+        while len(buf) - off >= fs:
+            # Single copy: memoryview slice → bytes for QImage backing storage.
+            frame_bytes = bytes(memoryview(buf)[off:off + fs])
+            off += fs
             img = QImage(
                 frame_bytes,
                 self._width,
@@ -327,7 +378,17 @@ class FFmpegPlayer(QWidget):
                 self._first_frame_seen = True
                 self._backoff_idx = 0
                 self.streamUp.emit()
-            self._frame = img
+            # Only keep the latest frame from this batch — repainting every
+            # frame in a multi-frame stdout burst is wasted work; only the
+            # most recent one matters for live display.
+            latest_frame = img
+        self._stdout_off = off
+        # Compact when the head waste grows large to bound memory.
+        if off > 16 * 1024 * 1024:
+            del buf[:off]
+            self._stdout_off = 0
+        if latest_frame is not None:
+            self._frame = latest_frame
             self.update()
 
     def _on_proc_finished(self, exit_code: int, exit_status: QProcess.ExitStatus) -> None:
