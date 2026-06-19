@@ -67,10 +67,6 @@ class NvrChannelTile(DraggableTileMixin, QFrame):
 
         self._overlay = _Overlay(self)
         self._overlay.set_name(f"{nvr.name} · {channel.name}")
-        # [FIX uxbug] Big identity badge so the user can tell which NVR port
-        # this tile maps to — necessary after drag-drop reorder, where the
-        # visual position no longer matches the port number.
-        self._overlay.set_identity_badge(f"{channel.name} · #{channel.number}")
         self._overlay.set_status("connecting")
 
         layout = QVBoxLayout(self)
