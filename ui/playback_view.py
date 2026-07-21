@@ -21,6 +21,7 @@ timeline.
 from __future__ import annotations
 
 import logging
+import time as time_mod
 from datetime import datetime, time, timedelta
 
 from PySide6.QtCore import QDate, Qt, QTimer, Signal
@@ -317,6 +318,13 @@ class PlaybackView(QWidget):
         self._restart_pending: tuple[FileRecord, datetime | None] | None = None
         self._playing_rec: FileRecord | None = None
         self._exporter: MP4Exporter | None = None
+        # [FIX archive-bp] Pause state. The firmware halts on Action=Pause but
+        # cannot resume the same claim, so resume = fresh claim with StartTime
+        # at the estimated pause position (verified StartTime seek).
+        self._paused = False
+        self._pause_position: datetime | None = None
+        self._play_base_time: datetime | None = None
+        self._play_started_monotonic: float = 0.0
 
         # DVRIP session dedicated to this archive window.
         self._client = DvripClient(self, auto_discover=False)
@@ -580,11 +588,19 @@ class PlaybackView(QWidget):
         self._extradata_cache = b""
         self._playing_rec = rec
         log.info("[FIX codec] PB start playback file=%s seek=%s", rec.file_name, seek_to)
-        # [FIX channel] Pass the channel — without it the NVR streams CAM01
-        # for every playback request regardless of which file was named.
+        # [FIX archive-bp] seek_to now really seeks: it is passed down as the
+        # claim's StartTime (hardware-verified to start mid-file). Track the
+        # playback base position + wall-clock so pause can estimate the
+        # current position for its resume re-claim.
         self._client.start_playback(
-            rec.file_name, rec.begin, rec.end, channel=self.channel_number
+            rec.file_name, rec.begin, rec.end, channel=self.channel_number,
+            seek_begin=seek_to,
         )
+        self._play_base_time = seek_to or rec.begin
+        self._play_started_monotonic = time_mod.monotonic()
+        self._paused = False
+        self._pause_position = None
+        self.player.suspend_stall_watchdog(False)
         # [FIX speed2] Sync speed UI back to 1× — the firmware always
         # resumes at 1× on a fresh Claim+Start.
         self._speed_idx = self._speed_levels.index(0)
@@ -696,7 +712,44 @@ class PlaybackView(QWidget):
         except Exception:
             log.exception("[FIX channel] first-frame audit failed (non-fatal)")
 
+    def _estimated_position(self) -> datetime | None:
+        """[FIX archive-bp] Approximate current playback position from wall
+        clock and the current speed multiplier. Accurate to a couple of
+        seconds at 1×; a coarse but useful estimate at trick-play speeds."""
+        if self._play_base_time is None or self._playing_rec is None:
+            return None
+        elapsed = time_mod.monotonic() - self._play_started_monotonic
+        multiplier = 2.0 ** self._speed_levels[self._speed_idx]
+        pos = self._play_base_time + timedelta(seconds=elapsed * multiplier)
+        return min(pos, self._playing_rec.end)
+
     def _on_play_pause(self) -> None:
+        # [FIX archive-bp] Three-state toggle:
+        #   playing  → Pause: DVRIP Pause halts the stream (bandwidth-free),
+        #              the last decoded frame stays on screen.
+        #   paused   → Resume: fresh claim seeking to the pause position (the
+        #              firmware cannot resume a paused claim in place).
+        #   stopped  → start the selected record from its beginning.
+        if self._paused and self._playing_rec is not None:
+            pos = self._pause_position
+            self._paused = False
+            self._pause_position = None
+            self._start_playback(self._playing_rec, seek_to=pos)
+            return
+        if self._playing_rec is not None and self._client is not None:
+            self._pause_position = self._estimated_position()
+            self._paused = True
+            try:
+                self._client.playback_pause()
+            except Exception:
+                log.exception("[FIX archive-bp] pause failed")
+            self.player.suspend_stall_watchdog(True)
+            self.btn_play.setText("▶ Продолжить")
+            if self._pause_position is not None:
+                self._set_status(
+                    f"Пауза на {self._pause_position.strftime('%H:%M:%S')}"
+                )
+            return
         self._start_playback(self._selected_record())
 
     def _on_stop(self) -> None:
@@ -715,6 +768,8 @@ class PlaybackView(QWidget):
         self._pending_es.clear()
         self._codec_detected = False
         self._playing_rec = None
+        self._paused = False
+        self._pause_position = None
         self.timeline.set_cursor(None)
         self.btn_play.setText("▶ Воспроизвести")
         self._set_status("Остановлено.")

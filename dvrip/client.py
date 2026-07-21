@@ -201,6 +201,7 @@ class DvripClient(QObject):
         begin: datetime,
         end: datetime,
         channel: int = 1,
+        seek_begin: datetime | None = None,
     ) -> None:
         """Play back an archived file for ``channel`` (1-based).
 
@@ -238,15 +239,23 @@ class DvripClient(QObject):
         # a new one, so the firmware doesn't hold the previous claim.
         if self._pending_playback is not None:
             self.stop_playback()
+        # [FIX archive-bp] A fresh claim always resumes the rx-deadline.
+        self.suspend_rx_deadline(False)
 
         params = {
             "FileName": file_name,
             "TransMode": "TCP",
         }
+        # [FIX archive-bp] StartTime-based seek — hardware-verified: claiming
+        # with StartTime mid-file starts the stream at that position (OSD
+        # timestamp matches the requested second). Clamp into the file range.
+        effective_begin = begin
+        if seek_begin is not None and begin <= seek_begin < end:
+            effective_begin = seek_begin
         body = {
             "Action": "Claim",
             "Parameter": params,
-            "StartTime": begin.strftime("%Y-%m-%d %H:%M:%S"),
+            "StartTime": effective_begin.strftime("%Y-%m-%d %H:%M:%S"),
             "EndTime": end.strftime("%Y-%m-%d %H:%M:%S"),
         }
         self._pending_playback = body
@@ -274,6 +283,26 @@ class DvripClient(QObject):
         # Give the firmware ~300 ms to process the Claim before issuing
         # Start — probe showed Ret=103 on back-to-back sends.
         QTimer.singleShot(300, _send_start)
+
+    def playback_pause(self) -> None:
+        """[FIX archive-bp] Halt the archive stream (1420 Action=Pause).
+
+        Hardware-verified: the firmware stops sending 1422 data but does NOT
+        support resuming the same claim (neither Action=Start nor a second
+        Pause restarts the flow). Resume is therefore implemented by the
+        caller as a fresh Claim with StartTime at the paused position.
+        Suspends the rx-deadline for the pause duration — silence is
+        expected, not a dead session.
+        """
+        if not self._logged_in or self._pending_playback is None:
+            return
+        params = self._pending_playback.get("Parameter", {})
+        self._send(MsgId.PLAYBACK_REQ_START, {
+            "Name": "OPPlayBack",
+            "SessionID": self._sid_str(),
+            "OPPlayBack": {"Action": "Pause", "Parameter": params},
+        })
+        self.suspend_rx_deadline(True)
 
     def playback_fast(self) -> None:
         """[FIX speed] Double the playback rate. DVRIP "Fast" action on 1420.
