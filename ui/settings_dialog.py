@@ -108,14 +108,16 @@ class SettingsDialog(QDialog):
         self.list.clear()
         for cam in self._cameras:
             path = "" if (cam.path or "").strip() in ("", "/") else cam.path
-            item = QListWidgetItem(f"📷  {cam.name}   ·   {cam.host}:{cam.port}{path}")
+            # [FIX icons] Text markers instead of emoji — emoji glyphs render
+            # as tofu boxes without an emoji font installed.
+            item = QListWidgetItem(f"[CAM]  {cam.name}   ·   {cam.host}:{cam.port}{path}")
             item.setData(ROLE_KIND, "camera")
             item.setData(ROLE_ID, cam.id)
             self.list.addItem(item)
         for nvr in self._nvrs:
             ch_n = len(nvr.channels)
             item = QListWidgetItem(
-                f"🗄  {nvr.name}   ·   {nvr.host}:{nvr.port}   ·   каналов: {ch_n}"
+                f"[NVR]  {nvr.name}   ·   {nvr.host}:{nvr.port}   ·   каналов: {ch_n}"
             )
             item.setData(ROLE_KIND, "nvr")
             item.setData(ROLE_ID, nvr.id)

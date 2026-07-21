@@ -59,6 +59,9 @@ class CameraForm(QDialog):
         self.port_spin = QSpinBox()
         self.port_spin.setRange(1, 65535)
         self.port_spin.setValue(self._camera.port)
+        # [FIX icons] qdarktheme renders the spin arrows as a broken dash on
+        # this platform; ports are typed anyway, so drop the buttons.
+        self.port_spin.setButtonSymbols(QSpinBox.NoButtons)
         self.user_edit = QLineEdit(self._camera.username)
         self.pass_edit = QLineEdit(password)
         self.pass_edit.setEchoMode(QLineEdit.Password)
@@ -67,12 +70,21 @@ class CameraForm(QDialog):
         self.transport_combo.addItems(["tcp", "udp"])
         self.transport_combo.setCurrentText(self._camera.transport)
 
-        show_pass = QPushButton("👁")
+        # [FIX icons] Painted eye icon — the previous "👁" emoji rendered as
+        # a tofu box on systems without an emoji font.
+        from ui.icon_util import eye_icon
+        show_pass = QPushButton()
+        show_pass.setIcon(eye_icon(slashed=True))
         show_pass.setCheckable(True)
         show_pass.setFixedWidth(34)
-        show_pass.toggled.connect(
-            lambda on: self.pass_edit.setEchoMode(QLineEdit.Normal if on else QLineEdit.Password)
-        )
+        show_pass.setToolTip("Показать пароль")
+        show_pass.setCursor(Qt.PointingHandCursor)
+
+        def _toggle_pass(on: bool) -> None:
+            self.pass_edit.setEchoMode(QLineEdit.Normal if on else QLineEdit.Password)
+            show_pass.setIcon(eye_icon(slashed=not on))
+            show_pass.setToolTip("Скрыть пароль" if on else "Показать пароль")
+        show_pass.toggled.connect(_toggle_pass)
         pass_row = QHBoxLayout()
         pass_row.setContentsMargins(0, 0, 0, 0)
         pass_row.addWidget(self.pass_edit)
