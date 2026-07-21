@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import Qt, Signal
+import time
+
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QFrame, QMenu, QSizePolicy, QVBoxLayout, QWidget
 
@@ -82,6 +84,24 @@ class NvrChannelTile(DraggableTileMixin, QFrame):
         self._chunk_count = 0
         self._first_chunk_logged = False
         self._parser: SofiaFrameParser | None = None
+
+        # [FIX freeze] Recovery state. A live tile must NEVER stay frozen:
+        # any session failure (TCP drop, login refused, rx deadline) schedules
+        # an automatic reconnect with backoff; a stall watchdog additionally
+        # detects "session alive but no video bytes" and forces the same
+        # reconnect path. `_stopped` gates everything so an explicitly
+        # stopped tile does not fight its own recovery.
+        self._stopped = True
+        self._reconnect_idx = 0
+        self._reconnect_backoff_ms = [3000, 5000, 10000, 30000]
+        self._reconnect_timer = QTimer(self)
+        self._reconnect_timer.setSingleShot(True)
+        self._reconnect_timer.timeout.connect(self._do_reconnect)
+        self._last_chunk_ms = 0
+        self._stall_timer = QTimer(self)
+        self._stall_timer.setInterval(5000)
+        self._stall_timer.timeout.connect(self._check_video_stall)
+
         self._init_drag()
 
     # ----- compatibility surface (so GridView can treat us like CameraTile) -----
@@ -99,6 +119,7 @@ class NvrChannelTile(DraggableTileMixin, QFrame):
     # ----- lifecycle ----------------------------------------------------
 
     def start(self) -> None:
+        self._stopped = False
         self._overlay.set_status("connecting")
         self._chunk_count = 0
         self._first_chunk_logged = False
@@ -112,6 +133,16 @@ class NvrChannelTile(DraggableTileMixin, QFrame):
         self._spawn_client()
 
     def stop(self) -> None:
+        # [FIX freeze] Explicit stop wins over recovery — cancel any pending
+        # reconnect and the stall watchdog before tearing the client down.
+        self._stopped = True
+        self._reconnect_timer.stop()
+        self._stall_timer.stop()
+        self._teardown_client()
+        self.player.stop()
+        self._overlay.set_status("down")
+
+    def _teardown_client(self) -> None:
         if self._client is not None:
             try:
                 self._client.close()
@@ -119,8 +150,6 @@ class NvrChannelTile(DraggableTileMixin, QFrame):
                 log.exception("[NVR] tile close failed")
             self._client.deleteLater()
             self._client = None
-        self.player.stop()
-        self._overlay.set_status("down")
 
     def reload_credentials(self) -> None:
         """Restart the DVRIP session — picks up a possibly-changed password."""
@@ -134,6 +163,10 @@ class NvrChannelTile(DraggableTileMixin, QFrame):
         c.loginOk.connect(self._on_login_ok)
         c.loginFailed.connect(lambda r: self._on_session_failed(f"login: {r}"))
         c.error.connect(lambda e: self._on_session_failed(f"net: {e}"))
+        # [FIX freeze] TCP drop / rx-deadline abort both surface here — this
+        # was previously left unconnected, which is why a dropped session
+        # parked the tile in "down" until an app restart.
+        c.disconnected.connect(lambda: self._on_session_failed("disconnected"))
         c.videoChunk.connect(self._on_video_chunk)
         self._client = c
         log.info(
@@ -154,17 +187,68 @@ class NvrChannelTile(DraggableTileMixin, QFrame):
             self._tile_id, self.channel.number, stream,
         )
         self._client.start_monitor(self.channel.number, stream_type=stream)
+        # [FIX freeze] Arm the stall watchdog with a fresh baseline: if no
+        # video chunk arrives within the stall window (even the FIRST one),
+        # the session is recycled.
+        self._last_chunk_ms = int(time.monotonic() * 1000)
+        self._stall_timer.start()
 
     def _on_session_failed(self, reason: str) -> None:
+        if self._stopped:
+            return
         log.warning("[NVR] tile %s session failure: %s", self._tile_id, reason)
         self._overlay.set_status("down")
-        # The DvripClient already emits disconnected; we don't auto-reconnect
-        # here for now — user can right-click → Переподключить.
+        # [FIX freeze] Auto-reconnect with backoff. Tear the dead client
+        # down and schedule a fresh session; backoff index resets when video
+        # actually flows again (first chunk of the new session).
+        if self._reconnect_timer.isActive():
+            return
+        self._stall_timer.stop()
+        self._teardown_client()
+        delay = self._reconnect_backoff_ms[
+            min(self._reconnect_idx, len(self._reconnect_backoff_ms) - 1)
+        ]
+        self._reconnect_idx += 1
+        log.warning(
+            "[FIX freeze] tile %s reconnect attempt %d in %d ms (%s)",
+            self._tile_id, self._reconnect_idx, delay, reason,
+        )
+        self._overlay.set_status("connecting")
+        self._reconnect_timer.start(delay)
+
+    def _do_reconnect(self) -> None:
+        if self._stopped:
+            return
+        self._overlay.set_status("connecting")
+        self._chunk_count = 0
+        self._first_chunk_logged = False
+        self._parser = SofiaFrameParser()
+        self._parser._name = self._tile_id
+        self._codec_detected = False
+        self.player.stop()
+        self._spawn_client()
+
+    def _check_video_stall(self) -> None:
+        # [FIX freeze] Session up but no MONITOR_DATA for >10 s — the NVR
+        # went silent (or the claim died server-side). Recycle the session
+        # through the same reconnect path.
+        if self._stopped or self._client is None:
+            return
+        silent_ms = int(time.monotonic() * 1000) - self._last_chunk_ms
+        if silent_ms > 10_000:
+            log.warning(
+                "[FIX freeze] tile %s video stalled (%d ms without chunks)",
+                self._tile_id, silent_ms,
+            )
+            self._on_session_failed("video stall")
 
     def _on_video_chunk(self, _channel_hint: int, data: bytes) -> None:
         self._chunk_count += 1
+        self._last_chunk_ms = int(time.monotonic() * 1000)
         if not self._first_chunk_logged:
             self._first_chunk_logged = True
+            # [FIX freeze] Video flows — the session recovered; reset backoff.
+            self._reconnect_idx = 0
             log.info(
                 "[NVR] tile %s first chunk: %d bytes head=%s",
                 self._tile_id, len(data), data[:32].hex(),

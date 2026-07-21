@@ -31,6 +31,7 @@ from __future__ import annotations
 import logging
 import re
 import shutil
+import time
 from typing import Optional
 
 from PySide6.QtCore import (
@@ -125,6 +126,19 @@ class FFmpegPlayer(QWidget):
         self._ready_timer.setSingleShot(True)
         self._ready_timer.timeout.connect(self._on_ready_timeout)
 
+        # [FIX freeze] Post-startup watchdog. The exit-only failure detection
+        # missed two real-world freeze modes: (a) ffmpeg alive but no frames
+        # decoded (wedged decoder), (b) ffmpeg alive but not reading stdin —
+        # the backpressure guard then drops every chunk forever. Both are
+        # detected here and recycled through the existing _on_failure →
+        # backoff-reconnect path.
+        self._last_frame_ms: int = 0
+        self._backpressure_since_ms: int = 0
+        self._stall_suspended: bool = False
+        self._stall_watchdog = QTimer(self)
+        self._stall_watchdog.setInterval(4000)
+        self._stall_watchdog.timeout.connect(self._check_decoder_stall)
+
     # Public API ---------------------------------------------------------
 
     def set_url(self, url: str) -> None:
@@ -148,6 +162,9 @@ class FFmpegPlayer(QWidget):
         self._stopped = True
         self._reconnect_timer.stop()
         self._ready_timer.stop()
+        self._stall_watchdog.stop()
+        self._last_frame_ms = 0
+        self._backpressure_since_ms = 0
         self._kill_process(detach=True)
         self._frame = None
         self._status_msg = "Остановлено"
@@ -215,6 +232,8 @@ class FFmpegPlayer(QWidget):
         self._frame_size = 0
         self._first_frame_seen = False
         self._fed_dropped_warned = False
+        self._last_frame_ms = 0
+        self._backpressure_since_ms = 0
 
         if self._input_mode == "pipe":
             # [FIX live-perf] Tile-sized output (640 wide) and a hard
@@ -384,7 +403,10 @@ class FFmpegPlayer(QWidget):
             if not self._first_frame_seen:
                 self._first_frame_seen = True
                 self._backoff_idx = 0
+                # [FIX freeze] Frames flow — arm the post-startup watchdog.
+                self._stall_watchdog.start()
                 self.streamUp.emit()
+            self._last_frame_ms = int(time.monotonic() * 1000)
             # Only keep the latest frame from this batch — repainting every
             # frame in a multi-frame stdout burst is wasted work; only the
             # most recent one matters for live display.
@@ -397,6 +419,50 @@ class FFmpegPlayer(QWidget):
         if latest_frame is not None:
             self._frame = latest_frame
             self.update()
+
+    def _check_decoder_stall(self) -> None:
+        """[FIX freeze] Detect a wedged-but-alive decoder and recycle it."""
+        if self._stopped or self._proc is None or not self._first_frame_seen:
+            return
+        if self._stall_suspended:
+            return
+        now = int(time.monotonic() * 1000)
+        # (a) No decoded frames for >8 s while the process claims to run.
+        if self._last_frame_ms and now - self._last_frame_ms > 8000:
+            log.warning(
+                "[FIX freeze] decoder stalled (%d ms without frames) — restarting",
+                now - self._last_frame_ms,
+            )
+            self._stall_watchdog.stop()
+            self._kill_process()
+            self._on_failure("decoder stalled")
+            return
+        # (b) stdin backpressure that never drains — ffmpeg stopped reading.
+        try:
+            pending = self._proc.bytesToWrite()
+        except Exception:
+            return
+        if pending > 2 * 1024 * 1024:
+            if self._backpressure_since_ms == 0:
+                self._backpressure_since_ms = now
+            elif now - self._backpressure_since_ms > 6000:
+                log.warning(
+                    "[FIX freeze] stdin backpressure stuck %d ms (%d B) — restarting",
+                    now - self._backpressure_since_ms, pending,
+                )
+                self._backpressure_since_ms = 0
+                self._stall_watchdog.stop()
+                self._kill_process()
+                self._on_failure("stdin backpressure stuck")
+        else:
+            self._backpressure_since_ms = 0
+
+    def suspend_stall_watchdog(self, suspended: bool) -> None:
+        """[FIX freeze] Playback pause legitimately stops the frame flow —
+        the owner suspends the watchdog for its duration."""
+        self._stall_suspended = suspended
+        if not suspended:
+            self._last_frame_ms = int(time.monotonic() * 1000)
 
     def _on_proc_finished(self, exit_code: int, exit_status: QProcess.ExitStatus) -> None:
         # exit_status: NormalExit / CrashExit

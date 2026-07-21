@@ -29,6 +29,15 @@ from .packet import Packet, pack, unpack
 log = logging.getLogger(__name__)
 
 KEEPALIVE_INTERVAL_MS = 10_000  # [FIX perf] was 20s — consumer NVRs idle-close ~15s
+# [FIX freeze] Consider the session dead when no bytes arrive for 3×
+# the keepalive interval (a healthy idle session gets a keepalive reply
+# every 10 s, so 30 s of silence means the NVR is gone or half-open).
+RX_DEADLINE_MS = 3 * KEEPALIVE_INTERVAL_MS
+
+
+def _monotonic_ms() -> int:
+    import time
+    return int(time.monotonic() * 1000)
 DEFAULT_PORT = 34567
 
 # [FIX arch] Wildcard "*" returns ONLY continuous segments on many Xiongmai
@@ -119,6 +128,21 @@ class DvripClient(QObject):
         self._keepalive.setInterval(KEEPALIVE_INTERVAL_MS)
         self._keepalive.timeout.connect(self._send_keepalive)
 
+        # [FIX freeze] RX deadline: if NOTHING arrives from the NVR for
+        # RX_DEADLINE_MS the connection is considered dead — half-open TCP
+        # (NVR power-cycled, RST lost) and silently-stalled sessions both
+        # look like this. Keepalive replies count as traffic, so a healthy
+        # idle session never trips it (keepalive interval is 10 s, deadline
+        # is 30 s). On trip we abort() the socket, which fires the existing
+        # disconnected/error paths that owners (tiles/PlaybackView) react to.
+        self._last_rx_ms: int = 0
+        self._rx_watchdog = QTimer(self)
+        self._rx_watchdog.setInterval(5000)
+        self._rx_watchdog.timeout.connect(self._check_rx_deadline)
+        # Playback pause legitimately silences the stream — owner can
+        # suspend the deadline for its duration.
+        self._rx_deadline_suspended: bool = False
+
         # Channel discovery is best-effort: firmwares differ a lot, so we try
         # several requests in sequence and accept whichever one yields a count.
         self._discovery_pending: bool = False
@@ -144,6 +168,7 @@ class DvripClient(QObject):
             except Exception:
                 log.exception("[DVRIP] logout failed")
         self._keepalive.stop()
+        self._rx_watchdog.stop()
         self._sock.disconnectFromHost()
 
     def start_monitor(self, channel: int, stream_type: str = "Main") -> None:
@@ -422,8 +447,13 @@ class DvripClient(QObject):
         self._send_login()
 
     def _on_disconnected(self) -> None:
+        # [FIX freeze] Idempotent: the rx-deadline abort path calls this
+        # directly AND Qt may emit disconnected for the same event.
+        if not self._logged_in and self._session_id == 0 and not self._keepalive.isActive():
+            return
         log.info("[DVRIP] tcp disconnected")
         self._keepalive.stop()
+        self._rx_watchdog.stop()
         self._logged_in = False
         self._session_id = 0
         # [FIX archive3] Don't leave a half-finished paginated file query in
@@ -445,6 +475,8 @@ class DvripClient(QObject):
         chunk = bytes(self._sock.readAll().data())
         if not chunk:
             return
+        # [FIX freeze] Any inbound byte counts as liveness.
+        self._last_rx_ms = _monotonic_ms()
         self._rx_buf.extend(chunk)
         log.debug("[DVRIP] rx +%d bytes (buf=%d)", len(chunk), len(self._rx_buf))
         self._drain_buffer()
@@ -482,6 +514,30 @@ class DvripClient(QObject):
         if not self._logged_in:
             return
         self._send(MsgId.KEEPALIVE_REQ, {"Name": "KeepAlive", "SessionID": self._sid_str()})
+
+    def suspend_rx_deadline(self, suspended: bool) -> None:
+        """[FIX freeze] Pause/resume the rx-deadline check. Used by playback
+        pause, where the NVR legitimately goes silent."""
+        self._rx_deadline_suspended = suspended
+        if not suspended:
+            self._last_rx_ms = _monotonic_ms()
+
+    def _check_rx_deadline(self) -> None:
+        if not self._logged_in or self._rx_deadline_suspended:
+            return
+        if self._last_rx_ms == 0:
+            return
+        silent_ms = _monotonic_ms() - self._last_rx_ms
+        if silent_ms > RX_DEADLINE_MS:
+            log.warning(
+                "[FIX freeze] no rx for %d ms (deadline %d) — aborting socket",
+                silent_ms, RX_DEADLINE_MS,
+            )
+            self._rx_watchdog.stop()
+            # abort() drops the connection immediately and fires
+            # disconnected — owners get their normal failure signal.
+            self._sock.abort()
+            self._on_disconnected()
 
     def _send(self, msg_id: int, body: dict[str, Any]) -> None:
         payload = json.dumps(body, separators=(",", ":")).encode("utf-8") + b"\x00"
@@ -568,6 +624,10 @@ class DvripClient(QObject):
         if ret == 100:  # Sofia "OK"
             self._logged_in = True
             self._keepalive.start()
+            # [FIX freeze] Arm the rx-deadline from a fresh baseline.
+            self._last_rx_ms = _monotonic_ms()
+            self._rx_deadline_suspended = False
+            self._rx_watchdog.start()
             log.info("[DVRIP] login ok session=0x%08x", self._session_id)
             self.loginOk.emit(self._session_id)
             if self._auto_discover:
