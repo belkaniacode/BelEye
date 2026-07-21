@@ -58,6 +58,36 @@ def find_ffmpeg() -> Optional[str]:
     return shutil.which("ffmpeg")
 
 
+def _shiboken_valid(obj) -> bool:
+    """[FIX shiboken] True if the underlying C++ object is still alive."""
+    try:
+        import shiboken6
+        return shiboken6.isValid(obj)
+    except ImportError:
+        return True
+
+
+def _safe_proc_kill(p: QProcess) -> None:
+    """[FIX shiboken] Deferred force-kill that tolerates the process object
+    having been destroyed in the meantime."""
+    if not _shiboken_valid(p):
+        return
+    try:
+        if p.state() != QProcess.NotRunning:
+            p.kill()
+    except RuntimeError:
+        pass
+
+
+def _safe_proc_delete(p: QProcess) -> None:
+    if not _shiboken_valid(p):
+        return
+    try:
+        p.deleteLater()
+    except RuntimeError:
+        pass
+
+
 def find_ffprobe() -> Optional[str]:
     return shutil.which("ffprobe")
 
@@ -340,11 +370,18 @@ class FFmpegPlayer(QWidget):
             except (RuntimeError, TypeError):
                 pass
         self._proc = None
+        # [FIX shiboken] Detach the QProcess from this widget BEFORE the
+        # deferred kill/delete timers: when the widget itself is deleted
+        # (make-before-break player swap), Qt's parent-child teardown would
+        # destroy the C++ QProcess early and the 1s/2s lambdas would raise
+        # "libshiboken: Internal C++ object already deleted". Unparented,
+        # the process outlives the widget and the deferred cleanup owns it.
+        proc.setParent(None)
         if proc.state() != QProcess.NotRunning:
             proc.terminate()
             # Async escalation: 1 s later, force-kill; 2 s later, delete.
-            QTimer.singleShot(1000, lambda p=proc: p.kill() if p.state() != QProcess.NotRunning else None)
-        QTimer.singleShot(2000, proc.deleteLater)
+            QTimer.singleShot(1000, lambda p=proc: _safe_proc_kill(p))
+        QTimer.singleShot(2000, lambda p=proc: _safe_proc_delete(p))
         if detach:
             self._ready_timer.stop()
 

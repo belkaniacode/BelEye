@@ -106,8 +106,10 @@ class MP4Exporter(QObject):
                 self._proc.closeWriteChannel()
             except Exception:
                 pass
-            QTimer.singleShot(2500, lambda p=self._proc:
-                              p.kill() if p and p.state() != QProcess.NotRunning else None)
+            # [FIX shiboken] Deferred kill must tolerate the QProcess being
+            # destroyed before the timer fires (see ffmpeg_player).
+            from video.ffmpeg_player import _safe_proc_kill
+            QTimer.singleShot(2500, lambda p=self._proc: _safe_proc_kill(p))
 
     # ---- internals --------------------------------------------------
 
