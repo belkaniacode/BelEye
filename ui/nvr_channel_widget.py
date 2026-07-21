@@ -92,6 +92,11 @@ class NvrChannelTile(DraggableTileMixin, QFrame):
         # reconnect path. `_stopped` gates everything so an explicitly
         # stopped tile does not fight its own recovery.
         self._stopped = True
+        # [FIX quality] Current live stream type ("Extra1" grid / "Main"
+        # focused). Applied at OPMonitor claim time; switchable at runtime.
+        self._current_stream = (
+            "Extra1" if getattr(nvr, "prefer_substream", True) else "Main"
+        )
         self._reconnect_idx = 0
         self._reconnect_backoff_ms = [3000, 5000, 10000, 30000]
         self._reconnect_timer = QTimer(self)
@@ -156,6 +161,36 @@ class NvrChannelTile(DraggableTileMixin, QFrame):
         self.stop()
         self.start()
 
+    def set_preferred_stream(self, stream: str) -> None:
+        """[FIX quality] Switch this tile between "Extra1" (sub stream, grid)
+        and "Main" (full quality, focused view) on the LIVE session.
+
+        Restarts the OPMonitor claim with the new stream type and recycles
+        the local decoder so codec detection re-runs against the new
+        bitstream. The output scale cap follows the stream: 640 px for the
+        sub stream, 1920 px for Main.
+        """
+        if stream == self._current_stream:
+            return
+        self._current_stream = stream
+        if self._stopped or self._client is None:
+            return
+        try:
+            self._client.stop_monitor(self.channel.number)
+        except Exception:
+            log.warning("[FIX quality] tile %s stop_monitor failed on stream switch",
+                        self._tile_id)
+        # Fresh parser + codec re-detect for the new bitstream.
+        self._parser = SofiaFrameParser()
+        self._parser._name = f"{self._tile_id}@{stream}"
+        self._codec_detected = False
+        self._first_chunk_logged = False
+        self.player.stop()
+        self.player.set_output_width(640 if stream != "Main" else 1920)
+        self._client.start_monitor(self.channel.number, stream_type=stream)
+        # Baseline for the stall watchdog: the switch itself takes a moment.
+        self._last_chunk_ms = int(time.monotonic() * 1000)
+
     # ----- DVRIP wiring ------------------------------------------------
 
     def _spawn_client(self) -> None:
@@ -178,14 +213,15 @@ class NvrChannelTile(DraggableTileMixin, QFrame):
     def _on_login_ok(self, _sid: int) -> None:
         if self._client is None:
             return
-        # [FIX perf] Default to the sub stream for the grid view — lower bitrate
-        # avoids saturating the NVR encoder / LAN when multiple tiles share the
-        # same device. Main stream stays available for the single-cam view.
-        stream = "Extra1" if getattr(self.nvr, "prefer_substream", True) else "Main"
+        # [FIX quality] Use the tile's current stream preference — Extra1 in
+        # the grid, Main when focused (GridView drives this via
+        # set_preferred_stream).
+        stream = self._current_stream
         log.info(
             "[FIX perf] tile %s login ok; starting OPMonitor ch=%d stream=%s",
             self._tile_id, self.channel.number, stream,
         )
+        self.player.set_output_width(640 if stream != "Main" else 1920)
         self._client.start_monitor(self.channel.number, stream_type=stream)
         # [FIX freeze] Arm the stall watchdog with a fresh baseline: if no
         # video chunk arrives within the stall window (even the FIRST one),

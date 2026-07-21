@@ -108,6 +108,10 @@ class FFmpegPlayer(QWidget):
         self._frame_size: int = 0
         self._first_frame_seen: bool = False
         self._fed_dropped_warned: bool = False
+        # [FIX quality] Output width cap for the scale filter. 640 suits the
+        # multi-tile grid; a focused/maximized tile raises it (with the Main
+        # stream) for full quality. Changing it at runtime restarts ffmpeg.
+        self._output_width: int = 640
 
         # Widget chrome
         self.setAutoFillBackground(True)
@@ -147,6 +151,18 @@ class FFmpegPlayer(QWidget):
     def set_input_codec(self, codec: str) -> None:
         """Set 'h264' or 'hevc' for pipe mode. Must be called before start()."""
         self._input_codec = codec
+
+    def set_output_width(self, width: int) -> None:
+        """[FIX quality] Change the scale-filter width cap. If the decoder is
+        already running with a different cap, restart it so the new value
+        takes effect immediately."""
+        width = max(160, int(width))
+        if width == self._output_width:
+            return
+        self._output_width = width
+        if self.is_running():
+            self._kill_process()
+            self._start_process()
 
     def start(self) -> None:
         if not self._stopped:
@@ -269,7 +285,7 @@ class FFmpegPlayer(QWidget):
                 "-f", self._input_codec,
                 "-i", "pipe:0",
                 "-an", "-sn",
-                "-vf", "scale='min(640,iw)':-2",
+                "-vf", f"scale='min({self._output_width},iw)':-2",
                 "-f", "rawvideo",
                 "-pix_fmt", "bgr24",
                 "pipe:1",
@@ -285,7 +301,7 @@ class FFmpegPlayer(QWidget):
                 "-an", "-sn",
                 "-i", self._url,
                 "-an", "-sn",
-                "-vf", "scale='min(960,iw)':-2,fps=20",
+                "-vf", f"scale='min({max(self._output_width, 960)},iw)':-2,fps=20",
                 "-f", "rawvideo",
                 "-pix_fmt", "bgr24",
                 "-",

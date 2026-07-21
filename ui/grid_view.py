@@ -173,6 +173,12 @@ class GridView(QWidget):
         self._relayout()
 
     def show_grid(self) -> None:
+        # [FIX quality] Returning to the grid drops the previously focused
+        # tile back to the sub stream so the NVR encoder isn't loaded with
+        # a Main-stream session nobody is looking at full-size.
+        prev = self._tiles.get(self._focused) if self._focused else None
+        if prev is not None and hasattr(prev, "set_preferred_stream"):
+            prev.set_preferred_stream("Extra1")
         self._mode = self.MODE_GRID
         self._focused = None
         self._relayout()
@@ -180,6 +186,16 @@ class GridView(QWidget):
     def show_single(self, camera_id: str) -> None:
         if camera_id not in self._tiles:
             return
+        # [FIX quality] Focused tile upgrades to the Main stream (full
+        # resolution). Only the ONE focused tile does this — the others
+        # keep their cheap sub-stream sessions.
+        prev = self._tiles.get(self._focused) if self._focused else None
+        if prev is not None and prev is not self._tiles[camera_id] \
+                and hasattr(prev, "set_preferred_stream"):
+            prev.set_preferred_stream("Extra1")
+        tile = self._tiles[camera_id]
+        if hasattr(tile, "set_preferred_stream"):
+            tile.set_preferred_stream("Main")
         self._mode = self.MODE_SINGLE
         self._focused = camera_id
         self._relayout()
