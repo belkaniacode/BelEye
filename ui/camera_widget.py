@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import QMimeData, QPoint, QRect, Qt, Signal
+from PySide6.QtCore import QMimeData, QPoint, QRect, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -58,6 +58,28 @@ class _Overlay(QWidget):
         # expecting CAM02 but got CAM04 because his persisted order is
         # [CAM01, CAM04, CAM03, CAM02].
         self._identity_badge: str = ""
+        # [FIX seamless2] Circular busy loader (top-right) shown while a
+        # background quality upgrade is warming up. Purely informational —
+        # the video underneath keeps playing.
+        self._busy = False
+        self._busy_angle = 0
+        self._busy_timer = QTimer(self)
+        self._busy_timer.setInterval(50)
+        self._busy_timer.timeout.connect(self._spin)
+
+    def set_busy(self, on: bool) -> None:
+        if self._busy == on:
+            return
+        self._busy = on
+        if on:
+            self._busy_timer.start()
+        else:
+            self._busy_timer.stop()
+        self.update()
+
+    def _spin(self) -> None:
+        self._busy_angle = (self._busy_angle + 24) % 360
+        self.update()
 
     def set_recording(self, on: bool) -> None:
         if self._recording == on:
@@ -127,6 +149,19 @@ class _Overlay(QWidget):
                 self.width() - 2 * inset - 1,
                 self.height() - 2 * inset - 1,
             )
+
+        # [FIX seamless2] Busy spinner — top-right, an arc rotating while a
+        # quality upgrade warms up in the background.
+        if self._busy:
+            size = 22
+            x = self.width() - size - 10
+            y = 10
+            pen = QPen(QColor(255, 255, 255, 230), 3)
+            pen.setCapStyle(Qt.RoundCap)
+            p.setPen(pen)
+            p.setBrush(Qt.NoBrush)
+            # drawArc angles are in 1/16 deg; span 100° arc.
+            p.drawArc(x, y, size, size, -self._busy_angle * 16, 100 * 16)
 
         # Drag handle (grip) in reorder mode — top-right corner
         if self._reorder:

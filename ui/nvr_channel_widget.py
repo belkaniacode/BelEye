@@ -107,6 +107,22 @@ class NvrChannelTile(DraggableTileMixin, QFrame):
         self._stall_timer.setInterval(5000)
         self._stall_timer.timeout.connect(self._check_video_stall)
 
+        # [FIX seamless2] Make-before-break stream switch. The current
+        # session + decoder keep RUNNING (video never freezes) while a
+        # second warm-up pipeline connects with the new stream type. Only
+        # when the warm decoder produces its first frame do we swap the
+        # widgets and tear the old pipeline down. A spinner on the overlay
+        # shows progress; failure/timeout simply keeps the old stream.
+        self._switch_client: DvripClient | None = None
+        self._switch_parser: SofiaFrameParser | None = None
+        self._switch_player: FFmpegPlayer | None = None
+        self._switch_codec_detected = False
+        self._switch_target: str | None = None
+        self._switch_timeout = QTimer(self)
+        self._switch_timeout.setSingleShot(True)
+        self._switch_timeout.setInterval(15000)
+        self._switch_timeout.timeout.connect(self._abort_switch)
+
         self._init_drag()
 
     # ----- compatibility surface (so GridView can treat us like CameraTile) -----
@@ -143,6 +159,8 @@ class NvrChannelTile(DraggableTileMixin, QFrame):
         self._stopped = True
         self._reconnect_timer.stop()
         self._stall_timer.stop()
+        # [FIX seamless2] Drop any in-flight warm-up pipeline too.
+        self._abort_switch()
         self._teardown_client()
         self.player.stop()
         self._overlay.set_status("down")
@@ -170,33 +188,142 @@ class NvrChannelTile(DraggableTileMixin, QFrame):
         bitstream. The output scale cap follows the stream: 640 px for the
         sub stream, 1920 px for Main.
         """
+        if stream == self._current_stream and self._switch_target is None:
+            return
+        if self._stopped or self._client is None:
+            self._current_stream = stream
+            return
+        if self._switch_target == stream:
+            return  # this exact switch already warming up
+        if self._switch_target is not None:
+            self._abort_switch()  # supersede an in-flight switch
         if stream == self._current_stream:
             return
-        self._current_stream = stream
-        if self._stopped or self._client is None:
+
+        # [FIX seamless2] Make-before-break: the CURRENT pipeline keeps
+        # playing untouched (the user must never see the video stop). A
+        # second DVRIP session + decoder warm up with the new stream type;
+        # the swap happens in _complete_switch on the warm decoder's FIRST
+        # frame. The firmware can't re-claim a channel inside one TCP
+        # session (Ret=103), which is why a second session is required.
+        self._switch_target = stream
+        self._overlay.set_busy(True)
+
+        wp = FFmpegPlayer(parent=self, input_mode="pipe", input_codec="h264")
+        wp.set_output_width(640 if stream != "Main" else 1920)
+        wp.hide()
+        self.layout().addWidget(wp)
+        wp.streamUp.connect(self._complete_switch)
+        self._switch_player = wp
+        self._switch_parser = SofiaFrameParser()
+        self._switch_parser._name = f"{self._tile_id}@{stream}+warm"
+        self._switch_codec_detected = False
+
+        wc = DvripClient(self, auto_discover=False)
+        wc.loginOk.connect(
+            lambda _sid: wc.start_monitor(self.channel.number, stream_type=stream)
+        )
+        wc.loginFailed.connect(lambda _r: self._abort_switch())
+        wc.error.connect(lambda _e: self._abort_switch())
+        wc.disconnected.connect(self._on_switch_client_disconnected)
+        wc.videoChunk.connect(self._on_switch_chunk)
+        self._switch_client = wc
+        wc.connect_to(self.nvr.host, self.nvr.port, self.nvr.username, self._password)
+        self._switch_timeout.start()
+
+    def _on_switch_client_disconnected(self) -> None:
+        # Only abort if the warm client is still in the warm-up role — after
+        # promotion its disconnects belong to the normal recovery path.
+        if self._switch_client is not None:
+            self._abort_switch()
+
+    def _on_switch_chunk(self, _ch: int, data: bytes) -> None:
+        if self._switch_parser is None or self._switch_player is None:
             return
-        # [FIX quality] The firmware does NOT release a channel claim within
-        # the same TCP session — Stop (even with matching StreamType) +
-        # re-Claim returns Ret=103 until the socket closes. Hardware-verified.
-        # The reliable switch is therefore a full session recycle.
-        #
-        # [FIX seamless] The recycle must be INVISIBLE: the last decoded
-        # frame stays on screen (player.stop(preserve_frame=True)) and the
-        # overlay is left alone, so expanding a tile shows the current
-        # picture instantly and simply sharpens ~1 s later when the Main
-        # stream's first frame lands. No "connecting" flash, no black.
-        self._reconnect_timer.stop()
-        self._stall_timer.stop()
-        self._teardown_client()
-        self.player.stop(preserve_frame=True)
-        self.player.set_output_width(640 if stream != "Main" else 1920)
-        self._parser = SofiaFrameParser()
-        self._parser._name = f"{self._tile_id}@{stream}"
-        self._codec_detected = False
-        self._first_chunk_logged = False
-        self._chunk_count = 0
-        self._stopped = False
-        self._spawn_client()
+        clean = self._switch_parser.feed(data)
+        if not clean:
+            return
+        if self._switch_codec_detected:
+            self._switch_player.feed_bytes(clean)
+            return
+        codec = detect_codec(clean) or "h264"
+        self._switch_player.set_input_codec(codec)
+        self._switch_player.start()
+        self._switch_player.feed_bytes(clean)
+        self._switch_codec_detected = True
+
+    def _complete_switch(self) -> None:
+        """Warm decoder produced its first frame — swap pipelines."""
+        if self._switch_player is None or self._switch_client is None:
+            return
+        stream = self._switch_target or self._current_stream
+        self._switch_timeout.stop()
+        self._overlay.set_busy(False)
+
+        old_player, old_client = self.player, self._client
+        new_player, new_client = self._switch_player, self._switch_client
+
+        # Promote warm pipeline to primary.
+        new_client.videoChunk.disconnect(self._on_switch_chunk)
+        new_client.videoChunk.connect(self._on_video_chunk)
+        new_client.disconnected.disconnect(self._on_switch_client_disconnected)
+        new_client.disconnected.connect(
+            lambda: self._on_session_failed("disconnected")
+        )
+        new_client.error.disconnect()
+        new_client.error.connect(lambda e: self._on_session_failed(f"net: {e}"))
+        new_player.streamUp.disconnect(self._complete_switch)
+        new_player.streamUp.connect(lambda: self._overlay.set_status("live"))
+        new_player.streamDown.connect(lambda _r: self._overlay.set_status("down"))
+
+        self.player = new_player
+        self._client = new_client
+        self._parser = self._switch_parser
+        self._codec_detected = self._switch_codec_detected
+        self._current_stream = stream
+        self._last_chunk_ms = int(time.monotonic() * 1000)
+        self._switch_player = None
+        self._switch_client = None
+        self._switch_parser = None
+        self._switch_target = None
+
+        new_player.show()
+        # Tear the OLD pipeline down only after the new one is visible.
+        if old_player is not None:
+            self.layout().removeWidget(old_player)
+            old_player.stop()
+            old_player.deleteLater()
+        if old_client is not None:
+            try:
+                old_client.close()
+            except Exception:
+                pass
+            old_client.deleteLater()
+        self._overlay.raise_()
+
+    def _abort_switch(self) -> None:
+        """Warm-up failed or timed out — keep the old stream, drop the warm
+        pipeline, and revert the target so a later attempt can retry."""
+        if self._switch_target is None:
+            return
+        log.warning("[FIX seamless2] tile %s stream switch to %s aborted",
+                    self._tile_id, self._switch_target)
+        self._switch_timeout.stop()
+        self._overlay.set_busy(False)
+        self._switch_target = None
+        if self._switch_client is not None:
+            wc, self._switch_client = self._switch_client, None
+            try:
+                wc.close()
+            except Exception:
+                pass
+            wc.deleteLater()
+        if self._switch_player is not None:
+            wp, self._switch_player = self._switch_player, None
+            self.layout().removeWidget(wp)
+            wp.stop()
+            wp.deleteLater()
+        self._switch_parser = None
 
     # ----- DVRIP wiring ------------------------------------------------
 
