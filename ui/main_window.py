@@ -110,7 +110,15 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("BelEye — Видеонаблюдение")
-        self.resize(1280, 760)
+        # [FIX hygiene] Restore last window geometry; fall back to a sane
+        # default on first run.
+        from PySide6.QtCore import QSettings
+        settings = QSettings("BelEye", "BelEye")
+        geo = settings.value("main_window/geometry")
+        if geo is not None:
+            self.restoreGeometry(geo)
+        else:
+            self.resize(1280, 760)
 
         # Window icon — many Wayland compositors honor the per-window icon
         # separately from the application-wide QApplication icon.
@@ -578,6 +586,17 @@ class MainWindow(QMainWindow):
         super().keyPressEvent(event)
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        # [FIX hygiene] Persist geometry and close any archive windows —
+        # they used to outlive the main window with their DVRIP sessions.
+        from PySide6.QtCore import QSettings
+        QSettings("BelEye", "BelEye").setValue(
+            "main_window/geometry", self.saveGeometry()
+        )
+        for view in list(self._playback_windows):
+            try:
+                view.close()
+            except Exception:
+                log.warning("[FIX hygiene] closing playback window failed")
         self._record_timer.stop()
         self._dispose_control_clients()
         self.grid.stop_all()

@@ -449,7 +449,12 @@ class DvripClient(QObject):
     def stop_monitor(self, channel: int) -> None:
         if not self._logged_in:
             return
-        log.info("[NVR] monitor stop ch=%d", channel)
+        # [FIX quality] Stop must reference the SAME StreamType the claim
+        # used — a mismatched Stop is ignored by the firmware and the
+        # channel stays held, so the next claim gets Ret=103.
+        pending = self._pending_monitors.get(channel)
+        stream_type = pending.stream_type if pending else "Main"
+        log.info("[NVR] monitor stop ch=%d stream=%s", channel, stream_type)
         self._send(
             MsgId.MONITOR_STOP_REQ,
             {
@@ -460,7 +465,7 @@ class DvripClient(QObject):
                     "Parameter": {
                         "Channel": channel - 1,
                         "CombinMode": "NONE",
-                        "StreamType": "Main",
+                        "StreamType": stream_type,
                         "TransMode": "TCP",
                     },
                 },

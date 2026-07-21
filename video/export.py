@@ -30,6 +30,7 @@ class MP4Exporter(QObject):
         self._codec: str = "h264"
         self._stderr_tail: list[str] = []
         self._bytes_written: int = 0
+        self._bp_warned: bool = False
         self._idle_timer = QTimer(self)
         self._idle_timer.setSingleShot(True)
         self._idle_timer.setInterval(IDLE_FINALIZE_MS)
@@ -40,6 +41,17 @@ class MP4Exporter(QObject):
         if not ffmpeg:
             self.finished.emit(False, "ffmpeg не найден в PATH")
             return False
+        # [FIX hygiene] A second start() used to overwrite self._proc and
+        # orphan the still-running previous ffmpeg. Kill it first.
+        if self._proc is not None and self._proc.state() != QProcess.NotRunning:
+            log.warning("[export] start() while previous export is running — killing it")
+            try:
+                self._proc.finished.disconnect(self._on_finished)
+            except (RuntimeError, TypeError):
+                pass
+            self._proc.kill()
+            self._proc.deleteLater()
+            self._proc = None
         self._out_path = out_path
         self._codec = codec
         self._stderr_tail.clear()
@@ -66,6 +78,17 @@ class MP4Exporter(QObject):
             return
         if self._proc.state() != QProcess.Running:
             return
+        # [FIX hygiene] Same 2MB stdin backpressure guard as FFmpegPlayer —
+        # a slow disk must not grow QProcess's write buffer unbounded.
+        try:
+            if self._proc.bytesToWrite() > 2 * 1024 * 1024:
+                if not self._bp_warned:
+                    log.warning("[export] stdin backpressure >2MB — dropping chunks")
+                    self._bp_warned = True
+                return
+            self._bp_warned = False
+        except Exception:
+            pass
         try:
             n = self._proc.write(QByteArray(data))
             if n > 0:

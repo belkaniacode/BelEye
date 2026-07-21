@@ -175,21 +175,15 @@ class NvrChannelTile(DraggableTileMixin, QFrame):
         self._current_stream = stream
         if self._stopped or self._client is None:
             return
-        try:
-            self._client.stop_monitor(self.channel.number)
-        except Exception:
-            log.warning("[FIX quality] tile %s stop_monitor failed on stream switch",
-                        self._tile_id)
-        # Fresh parser + codec re-detect for the new bitstream.
-        self._parser = SofiaFrameParser()
-        self._parser._name = f"{self._tile_id}@{stream}"
-        self._codec_detected = False
-        self._first_chunk_logged = False
-        self.player.stop()
+        # [FIX quality] The firmware does NOT release a channel claim within
+        # the same TCP session — Stop (even with matching StreamType) +
+        # re-Claim returns Ret=103 until the socket closes. Hardware-verified.
+        # The reliable switch is therefore a full session recycle: tear the
+        # client down and reconnect with the new stream preference (applied
+        # in _on_login_ok). Takes ~1 s, which is fine for a focus toggle.
+        self.stop()
         self.player.set_output_width(640 if stream != "Main" else 1920)
-        self._client.start_monitor(self.channel.number, stream_type=stream)
-        # Baseline for the stall watchdog: the switch itself takes a moment.
-        self._last_chunk_ms = int(time.monotonic() * 1000)
+        self.start()  # resets _stopped and reconnects with the new stream
 
     # ----- DVRIP wiring ------------------------------------------------
 

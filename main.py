@@ -57,8 +57,26 @@ def _apply_theme(app: QApplication) -> None:
         app.setPalette(pal)
 
 
+def _install_excepthook() -> None:
+    """[FIX hygiene] Uncaught exceptions in Qt slots are otherwise swallowed
+    by the event loop with only a stderr print. Log them as CRITICAL and
+    surface a dialog so a broken feature is visible instead of silent."""
+    def hook(exc_type, exc, tb):
+        log.critical("Uncaught exception", exc_info=(exc_type, exc, tb))
+        try:
+            if QApplication.instance() is not None:
+                QMessageBox.critical(
+                    None, "Внутренняя ошибка",
+                    f"{exc_type.__name__}: {exc}\n\nПодробности в логе.",
+                )
+        except Exception:
+            pass
+    sys.excepthook = hook
+
+
 def main() -> int:
     setup_logging()
+    _install_excepthook()
     log.info("Starting BelEye")
 
     app = QApplication(sys.argv)
