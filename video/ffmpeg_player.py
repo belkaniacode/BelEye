@@ -174,7 +174,10 @@ class FFmpegPlayer(QWidget):
         self.update()
         self._start_process()
 
-    def stop(self) -> None:
+    def stop(self, preserve_frame: bool = False) -> None:
+        """Stop the decoder. With ``preserve_frame=True`` the last decoded
+        image stays on screen — used for seamless stream switches where a
+        black 'stopped' flash would look like a reconnect to the user."""
         self._stopped = True
         self._reconnect_timer.stop()
         self._ready_timer.stop()
@@ -182,9 +185,10 @@ class FFmpegPlayer(QWidget):
         self._last_frame_ms = 0
         self._backpressure_since_ms = 0
         self._kill_process(detach=True)
-        self._frame = None
-        self._status_msg = "Остановлено"
-        self.update()
+        if not preserve_frame:
+            self._frame = None
+            self._status_msg = "Остановлено"
+            self.update()
 
     def is_running(self) -> bool:
         return self._proc is not None and self._proc.state() != QProcess.NotRunning

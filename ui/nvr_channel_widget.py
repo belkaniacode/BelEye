@@ -178,12 +178,25 @@ class NvrChannelTile(DraggableTileMixin, QFrame):
         # [FIX quality] The firmware does NOT release a channel claim within
         # the same TCP session — Stop (even with matching StreamType) +
         # re-Claim returns Ret=103 until the socket closes. Hardware-verified.
-        # The reliable switch is therefore a full session recycle: tear the
-        # client down and reconnect with the new stream preference (applied
-        # in _on_login_ok). Takes ~1 s, which is fine for a focus toggle.
-        self.stop()
+        # The reliable switch is therefore a full session recycle.
+        #
+        # [FIX seamless] The recycle must be INVISIBLE: the last decoded
+        # frame stays on screen (player.stop(preserve_frame=True)) and the
+        # overlay is left alone, so expanding a tile shows the current
+        # picture instantly and simply sharpens ~1 s later when the Main
+        # stream's first frame lands. No "connecting" flash, no black.
+        self._reconnect_timer.stop()
+        self._stall_timer.stop()
+        self._teardown_client()
+        self.player.stop(preserve_frame=True)
         self.player.set_output_width(640 if stream != "Main" else 1920)
-        self.start()  # resets _stopped and reconnects with the new stream
+        self._parser = SofiaFrameParser()
+        self._parser._name = f"{self._tile_id}@{stream}"
+        self._codec_detected = False
+        self._first_chunk_logged = False
+        self._chunk_count = 0
+        self._stopped = False
+        self._spawn_client()
 
     # ----- DVRIP wiring ------------------------------------------------
 
