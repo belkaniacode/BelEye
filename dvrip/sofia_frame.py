@@ -9,8 +9,18 @@ Common markers seen in the wild (python-dvr, sofiactl, dvrip-py):
 
   0xFC  I-frame (key)         16-byte header, length at bytes 12..15 (u32 LE)
   0xFD  P-frame               8-byte header,  length at bytes 4..7   (u32 LE)
-  0xFA  audio                 16-byte header, length at bytes 12..15
+  0xFA  audio                 8-byte header,  length at bytes 6..7   (u16 LE)
   0xFB  info / sub stream     16-byte header, length at bytes 12..15
+
+[FIX stutter] The audio layout was hardware-verified on the Xiongmai
+NBD80S16S-KL: header is ``00 00 01 FA <media u8> <rate u8> <len u16 LE>``
+followed by ``len`` bytes of G.711 (738/738 frames in a 30 s capture
+match; the previously assumed 16-byte header read PCM samples as a
+u32 length, forcing a parser resync on EVERY audio frame — and when
+the resync scan hit a byte pattern inside the audio that looked like a
+frame marker, it swallowed part of the following VIDEO frame, which is
+what produced the constant "undecodable NALU" decoder spam and the
+random multi-second tile freezes until the next IDR).
 
 Some firmwares interleave audio + video on the same monitor session; we drop
 audio + info and concatenate I- and P-frame payloads into a clean H.264
@@ -48,6 +58,10 @@ class SofiaFrameParser:
     _buf: bytearray = field(default_factory=bytearray)
     _passthrough: bool | None = None
     _frames_seen: int = 0
+    # [FIX stutter] Count of I-frames extracted so far. Consumers use this
+    # to hold off feeding a decoder until the stream has a keyframe —
+    # decoding P-frames from mid-GOP only yields reference-error spam.
+    iframes_seen: int = 0
     _bytes_yielded: int = 0
     _resync_count: int = 0
     _name: str = "?"
@@ -136,7 +150,16 @@ class SofiaFrameParser:
                 return 0, b""
             return total, bytes(buf[8:total])
 
-        # I-frame / audio / info: 16-byte header, length at bytes 12..15
+        if marker == MARKER_AUDIO:
+            # [FIX stutter] 8-byte header, length at bytes 6..7 (u16 LE).
+            # Payload is audio — dropped.
+            length = struct.unpack_from("<H", buf, 6)[0]
+            total = 8 + length
+            if len(buf) < total:
+                return 0, b""
+            return total, b""
+
+        # I-frame / info: 16-byte header, length at bytes 12..15
         if len(buf) < 16:
             return 0, b""
         length = struct.unpack_from("<I", buf, 12)[0]
@@ -146,8 +169,9 @@ class SofiaFrameParser:
         if len(buf) < total:
             return 0, b""
         if marker == MARKER_IFRAME:
+            self.iframes_seen += 1
             return total, bytes(buf[16:total])
-        return total, b""  # audio / info — drop
+        return total, b""  # info — drop
 
     def _resync_to_marker(self) -> int:
         """Return how many bytes to drop to reach the next valid frame marker."""

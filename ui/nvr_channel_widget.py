@@ -243,6 +243,9 @@ class NvrChannelTile(DraggableTileMixin, QFrame):
         clean = self._switch_parser.feed(data)
         if not clean:
             return
+        # [FIX stutter] Same keyframe gate as the primary pipeline.
+        if self._switch_parser.iframes_seen == 0:
+            return
         if self._switch_codec_detected:
             self._switch_player.feed_bytes(clean)
             return
@@ -426,6 +429,11 @@ class NvrChannelTile(DraggableTileMixin, QFrame):
         # Strip the Sofia frame wrapper before feeding ffmpeg.
         clean = self._parser.feed(data) if self._parser else data
         if not clean:
+            return
+        # [FIX stutter] Never feed the decoder before the first keyframe —
+        # mid-GOP P-frames only produce reference-error spam and garbage
+        # frames. The firmware sends an I-frame within one GOP (~2 s).
+        if self._parser is not None and self._parser.iframes_seen == 0:
             return
 
         if self._codec_detected:
