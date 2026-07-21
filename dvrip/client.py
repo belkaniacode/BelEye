@@ -250,6 +250,33 @@ class DvripClient(QObject):
         # Start — probe showed Ret=103 on back-to-back sends.
         QTimer.singleShot(300, _send_start)
 
+    def playback_fast(self) -> None:
+        """[FIX speed] Double the playback rate. DVRIP "Fast" action on 1420.
+        Firmware caps the rate internally (usually 8×); subsequent calls past
+        that cap are silently no-ops on the device.
+        """
+        if not self._logged_in or self._pending_playback is None:
+            return
+        params = self._pending_playback.get("Parameter", {})
+        log.info("[FIX speed] PB 1420 Fast")
+        self._send(MsgId.PLAYBACK_REQ_START, {
+            "Name": "OPPlayBack",
+            "SessionID": self._sid_str(),
+            "OPPlayBack": {"Action": "Fast", "Parameter": params},
+        })
+
+    def playback_slow(self) -> None:
+        """[FIX speed] Halve the playback rate. DVRIP "Slow" action on 1420."""
+        if not self._logged_in or self._pending_playback is None:
+            return
+        params = self._pending_playback.get("Parameter", {})
+        log.info("[FIX speed] PB 1420 Slow")
+        self._send(MsgId.PLAYBACK_REQ_START, {
+            "Name": "OPPlayBack",
+            "SessionID": self._sid_str(),
+            "OPPlayBack": {"Action": "Slow", "Parameter": params},
+        })
+
     def stop_playback(self) -> None:
         if not self._logged_in or self._pending_playback is None:
             return

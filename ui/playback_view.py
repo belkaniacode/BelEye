@@ -116,6 +116,54 @@ class _DayTimeline(QWidget):
         self.seekRequested.emit(when)
 
 
+def _extract_param_sets(data: bytes, codec: str) -> bytes:
+    """[FIX speed3-extradata] Return concatenated VPS/SPS/PPS NAL units
+    from an Annex-B HEVC or H.264 elementary stream. Used to cache the
+    parameter sets at original playback start, so we can re-inject them
+    into a fresh ffmpeg process when the decoder is restarted on a
+    speed change.
+
+    HEVC NAL type = (byte >> 1) & 0x3F with forbidden_zero (bit 7) = 0.
+        32 = VPS, 33 = SPS, 34 = PPS.
+    H.264 NAL type = byte & 0x1F.
+        7 = SPS, 8 = PPS.
+    """
+    if codec == "hevc":
+        wanted = {32, 33, 34}
+        def nal_type(b: int) -> int | None:
+            if b & 0x80:
+                return None
+            return (b >> 1) & 0x3F
+    else:
+        wanted = {7, 8}
+        def nal_type(b: int) -> int | None:
+            return b & 0x1F
+
+    out = bytearray()
+    i = 0
+    n = len(data)
+    while i < n - 4:
+        if data[i:i + 3] == b"\x00\x00\x01":
+            t = nal_type(data[i + 3])
+            if t in wanted:
+                end = data.find(b"\x00\x00\x01", i + 3)
+                if end < 0:
+                    end = n
+                # Strip a preceding 0x00 from the prior start code if
+                # present (we want a clean 00 00 00 01 start code per NAL).
+                payload_end = end
+                if payload_end > 0 and data[payload_end - 1] == 0:
+                    payload_end -= 1
+                out.extend(b"\x00\x00\x00\x01")
+                out.extend(data[i + 3:payload_end])
+                i = end
+                continue
+            i += 3
+        else:
+            i += 1
+    return bytes(out)
+
+
 class PlaybackView(QWidget):
     """Top-level archive window for one (NVR, channel)."""
 
@@ -230,8 +278,14 @@ class PlaybackView(QWidget):
         root.addWidget(left_w)
         root.addWidget(right_w, 1)
 
-        self._speed_idx = 0
-        self._speeds = [1, 2, 4]
+        # [FIX speed2] Speed levels as DVRIP Fast/Slow steps relative to 1×.
+        # Fast doubles, Slow halves. ffmpeg now uses trick-play decode flags
+        # (genpts+igndts, ignore_err) so the I-frame-only stream the NVR
+        # emits at Fast/Slow renders as a key-frame slideshow instead of
+        # freezing the picture.
+        self._speed_levels = [-2, -1, 0, 1, 2, 3]
+        self._speed_labels = ["¼×", "½×", "1×", "2×", "4×", "8×"]
+        self._speed_idx = 2  # index of 1×
 
         # [FIX archive3] Streaming state — archive data flows on opcode 1422,
         # exposed via the ``playbackChunk`` signal (NOT ``videoChunk``, which
@@ -246,6 +300,14 @@ class PlaybackView(QWidget):
         # IDR slice (no SPS/VPS) — see [FIX codec] in dvrip/sofia_frame.py.
         self._pending_es: bytearray = bytearray()
         self._codec_detect_cap: int = 256 * 1024
+        # [FIX speed3-extradata] Cache the very first ES bytes (VPS+SPS+PPS+IDR
+        # of the original stream) so we can prepend them to ffmpeg's stdin
+        # when the decoder is restarted on a Fast/Slow speed change. The
+        # firmware never re-sends parameter sets after speed switches; without
+        # the cached extradata the new decoder errors with "PPS id out of
+        # range" on every slice and renders nothing.
+        self._extradata_cache: bytes = b""
+        self._extradata_cache_target: int = 64 * 1024
         # NVR-side "Stop then immediately Claim again" sometimes makes the
         # firmware drop the new claim. We delay the new playback by a few
         # hundred ms after a stop so the device is ready.
@@ -513,6 +575,9 @@ class PlaybackView(QWidget):
         self._parser._name = f"pb:{rec.file_name.rsplit('/', 1)[-1]}"
         self._codec_detected = False
         self._pending_es.clear()
+        # [FIX speed3-extradata] New file = different parameter sets — start
+        # over so we cache fresh extradata from the new file's first bytes.
+        self._extradata_cache = b""
         self._playing_rec = rec
         log.info("[FIX codec] PB start playback file=%s seek=%s", rec.file_name, seek_to)
         # [FIX channel] Pass the channel — without it the NVR streams CAM01
@@ -520,6 +585,10 @@ class PlaybackView(QWidget):
         self._client.start_playback(
             rec.file_name, rec.begin, rec.end, channel=self.channel_number
         )
+        # [FIX speed2] Sync speed UI back to 1× — the firmware always
+        # resumes at 1× on a fresh Claim+Start.
+        self._speed_idx = self._speed_levels.index(0)
+        self.btn_speed.setText(self._speed_labels[self._speed_idx])
         self.timeline.set_cursor(seek_to or rec.begin)
         self.btn_play.setText("⏸ Пауза")
         self._set_status(
@@ -558,18 +627,39 @@ class PlaybackView(QWidget):
             )
         buffered = bytes(self._pending_es)
         self._pending_es.clear()
+        # [FIX speed3-extradata] Cache ONLY the VPS/SPS/PPS NAL units from
+        # the very first decoder bootstrap (not the surrounding video data,
+        # which would confuse a restarted decoder's PTS state). On every
+        # subsequent decoder restart (Fast/Slow speed change) those few-
+        # kilobyte parameter sets get re-injected so the new ffmpeg
+        # process can decode the post-Fast IDR slices.
+        if not self._extradata_cache:
+            self._extradata_cache = _extract_param_sets(buffered, codec)
+            log.info("[FIX speed3-extradata] cached %d B param sets (codec=%s) "
+                     "for decoder restarts", len(self._extradata_cache), codec)
         log.info(
             "[FIX codec] PB codec=%s, starting decoder (buffered %d B)",
             codec, len(buffered),
         )
         # [B2 audit] Dump the buffered first-frame elementary stream to disk
-        # AND render a thumbnail (best-effort). The OSD watermark on the
-        # thumbnail proves the playback came from the channel the user
-        # actually clicked, not from CAM01. Path is greppable in the log
-        # for field diagnostics.
+        # AND render a thumbnail (best-effort).
         self._audit_first_frame(buffered, codec)
         self.player.set_input_codec(codec)
         self.player.start()
+        # [FIX speed3-extradata] On non-initial decoder spawns (speed changes),
+        # prepend the cached extradata so the new ffmpeg has VPS/SPS/PPS for
+        # the incoming slices.
+        if self._extradata_cache:
+            # Check if the buffered chunk already contains the parameter
+            # sets at the start (initial 1× bootstrap will). If not, this
+            # is a decoder restart for a Fast/Slow speed switch — prepend.
+            buffered_param_sets = _extract_param_sets(
+                buffered[:8 * 1024], codec
+            )
+            if not buffered_param_sets:
+                log.info("[FIX speed3-extradata] prepending %d B param sets",
+                         len(self._extradata_cache))
+                self.player.feed_bytes(self._extradata_cache)
         self.player.feed_bytes(buffered)
         if self._exporter is not None:
             if self._exporter.start(self._exporter_out_path, codec):
@@ -630,8 +720,43 @@ class PlaybackView(QWidget):
         self._set_status("Остановлено.")
 
     def _cycle_speed(self) -> None:
-        self._speed_idx = (self._speed_idx + 1) % len(self._speeds)
-        self.btn_speed.setText(f"{self._speeds[self._speed_idx]}×")
+        """[FIX speed3] Cycle speeds. Sends the right number of DVRIP
+        Fast/Slow opcodes AND restarts the local ffmpeg decoder so the
+        new bitstream (often I-frame-only at non-1×, with different
+        SPS/PPS context) is decoded from a clean state. Without the
+        decoder restart, HEVC's internal P-frame reference state gets
+        stuck and the visible image freezes even though Fast was sent.
+        """
+        old_level = self._speed_levels[self._speed_idx]
+        self._speed_idx = (self._speed_idx + 1) % len(self._speed_levels)
+        new_level = self._speed_levels[self._speed_idx]
+        self.btn_speed.setText(self._speed_labels[self._speed_idx])
+        if self._client is None or self._playing_rec is None:
+            return
+        delta = new_level - old_level
+        log.info("[FIX speed3] -> %s (delta=%+d)",
+                 self._speed_labels[self._speed_idx], delta)
+        if delta > 0:
+            for _ in range(delta):
+                self._client.playback_fast()
+        elif delta < 0:
+            for _ in range(-delta):
+                self._client.playback_slow()
+        # Force decoder restart: kill ffmpeg, reset parser + codec detection.
+        # The next inbound chunk on playbackChunk will re-detect the codec
+        # from a fresh Sofia parser and spawn a new ffmpeg process — that
+        # process locks onto the IDR slices of the new (Fast/Slow) stream
+        # cleanly instead of trying to interpret them against the previous
+        # GOP's reference state.
+        log.info("[FIX speed3] restarting decoder for new bitstream")
+        self.player.stop()
+        self._parser = SofiaFrameParser()
+        self._parser._name = (
+            f"pb:{self._playing_rec.file_name.rsplit('/', 1)[-1]}"
+            f"@{self._speed_labels[self._speed_idx]}"
+        )
+        self._codec_detected = False
+        self._pending_es.clear()
 
     def _on_export(self) -> None:
         rec = self._selected_record()

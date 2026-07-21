@@ -238,8 +238,15 @@ class FFmpegPlayer(QWidget):
                 # the rare resync glitch instead of stalling the decoder.
                 "-probesize", "32",
                 "-analyzeduration", "0",
-                "-fflags", "nobuffer+discardcorrupt",
+                # [FIX trick-play] Tolerate the I-frame-only stream the NVR
+                # emits while a Fast/Slow playback is active: regenerate
+                # PTS from input rate, ignore stale DTS, and never bail out
+                # on a missing reference frame. These flags are safe at 1×
+                # too — a healthy continuous GOP still decodes cleanly
+                # under them.
+                "-fflags", "nobuffer+discardcorrupt+genpts+igndts",
                 "-flags", "low_delay",
+                "-err_detect", "ignore_err",
                 "-f", self._input_codec,
                 "-i", "pipe:0",
                 "-an", "-sn",
