@@ -3,9 +3,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QSize, Qt, QTimer
-from PySide6.QtGui import QAction, QIcon, QKeySequence, QPainter, QPixmap
-from PySide6.QtSvg import QSvgRenderer
+from PySide6.QtCore import QSize, Qt, QTimer
+from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QDialog,
     QFrame,
@@ -13,6 +12,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QPushButton,
+    QSizePolicy,
     QStatusBar,
     QToolBar,
     QVBoxLayout,
@@ -24,86 +24,11 @@ from app import nvr_config as nvrcfg
 from app import secrets as keystore
 from app.nvr_config import nvr_keyring_user
 from .grid_view import GridView
+from .icon_util import svg_icon
 from .settings_dialog import SettingsDialog
+from .theme import theme
 
 log = logging.getLogger(__name__)
-
-
-# Lucide-style icons embedded as SVG strings. 24x24 viewBox, stroke-based,
-# 2 px stroke, round line caps/joins. Rendered via QSvgRenderer into a
-# QPixmap so they stay crisp at any size and look identical across platforms.
-_ICON_SVGS: dict[str, str] = {
-    "settings": (
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
-        ' stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
-        '<path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"/>'
-        '<path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9 1.65 1.65 0 0 0 4.27 7.18l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/>'
-        '</svg>'
-    ),
-    "refresh": (
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
-        ' stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
-        '<polyline points="23 4 23 10 17 10"/>'
-        '<path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>'
-        '</svg>'
-    ),
-    "grid": (
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
-        ' stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
-        '<rect x="3"  y="3"  width="7" height="7" rx="1"/>'
-        '<rect x="14" y="3"  width="7" height="7" rx="1"/>'
-        '<rect x="3"  y="14" width="7" height="7" rx="1"/>'
-        '<rect x="14" y="14" width="7" height="7" rx="1"/>'
-        '</svg>'
-    ),
-    "reorder": (
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
-        ' stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
-        '<path d="M7 3v18"/>'
-        '<polyline points="3 7 7 3 11 7"/>'
-        '<path d="M17 21V3"/>'
-        '<polyline points="21 17 17 21 13 17"/>'
-        '</svg>'
-    ),
-    "fullscreen": (
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
-        ' stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
-        '<path d="M8 3H5a2 2 0 0 0-2 2v3"/>'
-        '<path d="M21 8V5a2 2 0 0 0-2-2h-3"/>'
-        '<path d="M3 16v3a2 2 0 0 0 2 2h3"/>'
-        '<path d="M16 21h3a2 2 0 0 0 2-2v-3"/>'
-        '</svg>'
-    ),
-}
-
-
-def _make_icon(name: str, size: int = 14, color: str = "#cbd5e1", right_pad: int = 8) -> QIcon:
-    """
-    Lucide SVG → QIcon. ``right_pad`` adds transparent space to the right
-    of the icon, baked into the pixmap. This is how we get a real gap
-    between the icon and the toolbar label — Qt's ToolButtonTextBesideIcon
-    does not expose a configurable icon-text spacing.
-    """
-    svg_template = _ICON_SVGS.get(name)
-    if svg_template is None:
-        return QIcon()
-    svg = svg_template.format(color=color)
-    renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
-    scale = 2
-    total_w = (size + right_pad) * scale
-    total_h = size * scale
-    pm = QPixmap(total_w, total_h)
-    pm.fill(Qt.transparent)
-    p = QPainter(pm)
-    p.setRenderHint(QPainter.Antialiasing, True)
-    p.setRenderHint(QPainter.SmoothPixmapTransform, True)
-    # Render the SVG into the left "size × size" square; the right side
-    # stays transparent, becoming the icon-text gap.
-    from PySide6.QtCore import QRectF
-    renderer.render(p, QRectF(0, 0, size * scale, size * scale))
-    p.end()
-    pm.setDevicePixelRatio(scale)
-    return QIcon(pm)
 
 
 class MainWindow(QMainWindow):
@@ -161,6 +86,9 @@ class MainWindow(QMainWindow):
         self._build_toolbar()
         self.setStatusBar(QStatusBar())
 
+        # Icons and the banner carry baked colors; refresh them on every flip.
+        theme.changed.connect(self._on_theme_changed)
+
         self._reload_cameras()
 
     # Toolbar / banner --------------------------------------------------
@@ -180,69 +108,99 @@ class MainWindow(QMainWindow):
 
         # Icon-text gap is baked into the icon pixmap (transparent right pad)
         # so the labels can use plain text without leading spaces.
-        self.act_settings = QAction(_make_icon("settings"), "Настройки", self)
+        self.act_settings = QAction(svg_icon("settings"), "Настройки", self)
         self.act_settings.triggered.connect(self._open_settings)
         tb.addAction(self.act_settings)
 
-        self.act_refresh = QAction(_make_icon("refresh"), "Обновить", self)
+        self.act_refresh = QAction(svg_icon("refresh"), "Обновить", self)
         self.act_refresh.triggered.connect(self._reload_cameras)
         tb.addAction(self.act_refresh)
 
         tb.addSeparator()
 
-        self.act_view = QAction(_make_icon("grid"), "Сетка / 1 камера", self)
+        self.act_view = QAction(svg_icon("grid"), "Сетка / 1 камера", self)
         self.act_view.setShortcut(QKeySequence("Ctrl+G"))
         self.act_view.triggered.connect(self.grid.toggle_mode)
         tb.addAction(self.act_view)
 
-        self.act_reorder = QAction(_make_icon("reorder"), "Перетащить", self)
+        self.act_reorder = QAction(svg_icon("reorder"), "Перетащить", self)
         self.act_reorder.setToolTip("Включить режим перетаскивания камер")
         self.act_reorder.triggered.connect(self._enter_reorder_mode)
         tb.addAction(self.act_reorder)
 
-        self.act_fullscreen = QAction(_make_icon("fullscreen"), "Полный экран", self)
+        self.act_fullscreen = QAction(svg_icon("fullscreen"), "Полный экран", self)
         self.act_fullscreen.setShortcut(QKeySequence("F11"))
         self.act_fullscreen.triggered.connect(self._toggle_fullscreen)
         tb.addAction(self.act_fullscreen)
 
+        # Expanding spacer pins everything after it to the right edge —
+        # QToolBar has no "align right" of its own.
+        spacer = QWidget(tb)
+        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        spacer.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        # Without this the universal "QWidget { background }" rule paints the
+        # spacer in the window color, leaving a visible slab in the toolbar.
+        spacer.setStyleSheet("background: transparent;")
+        tb.addWidget(spacer)
+
+        # Theme toggle, far right.
+        self.act_theme = QAction(self)
+        self.act_theme.triggered.connect(theme.toggle)
+        tb.addAction(self.act_theme)
+
+        # Which toolbar actions carry a baked-pixmap icon, so _retint_toolbar
+        # can rebuild them when the theme flips.
+        self._toolbar_icons = [
+            (self.act_settings, "settings"),
+            (self.act_refresh, "refresh"),
+            (self.act_view, "grid"),
+            (self.act_reorder, "reorder"),
+            (self.act_fullscreen, "fullscreen"),
+        ]
+
         tb.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        # Icon-only for the toggle: its label would be the only text on that
+        # side of the bar and reads as clutter. Must come *after* the
+        # toolbar-wide style, which otherwise overwrites per-button settings.
+        toggle_btn = tb.widgetForAction(self.act_theme)
+        if toggle_btn is not None:
+            toggle_btn.setToolButtonStyle(Qt.ToolButtonIconOnly)
+            toggle_btn.setCursor(Qt.PointingHandCursor)
+
+        self._retint_toolbar()
+
+    def _retint_toolbar(self) -> None:
+        """Rebuild every toolbar icon for the active theme.
+
+        A QIcon holds a rasterized pixmap with the stroke color baked in; it
+        cannot re-tint itself, so the icons must be recreated on each theme
+        change or they stay light-grey on a white toolbar.
+        """
+        for action, name in getattr(self, "_toolbar_icons", ()):
+            action.setIcon(svg_icon(name))
+        # The toggle advertises the theme you will GET, not the one you're in.
+        going_light = theme.is_dark()
+        self.act_theme.setIcon(svg_icon("sun" if going_light else "moon", right_pad=0))
+        label = "Светлая тема" if going_light else "Тёмная тема"
+        self.act_theme.setText(label)
+        self.act_theme.setToolTip(f"Переключить на: {label}")
 
     def _build_reorder_banner(self) -> QFrame:
         banner = QFrame()
         banner.setObjectName("ReorderBanner")
         banner.setFixedHeight(56)
-        banner.setStyleSheet(
-            "#ReorderBanner {"
-            "  background: #13161c;"
-            "  border-bottom: 1px solid #1f242b;"
-            "}"
-        )
 
         # Left accent strip — subtle, single color, low chroma
         accent = QFrame()
         accent.setFixedWidth(3)
-        accent.setStyleSheet("background: #3b82f6;")
 
         # Icon glyph (Unicode arrows) in a muted bubble
         icon = QLabel("⇅")
         icon.setFixedSize(32, 32)
         icon.setAlignment(Qt.AlignCenter)
-        icon.setStyleSheet(
-            "QLabel {"
-            "  background: rgba(59, 130, 246, 0.12);"
-            "  color: #60a5fa;"
-            "  border-radius: 8px;"
-            "  font-size: 16px;"
-            "  font-weight: 600;"
-            "}"
-        )
 
         title = QLabel("Режим перетаскивания")
-        title.setStyleSheet(
-            "color: #e5e7eb; font-size: 13px; font-weight: 600; letter-spacing: 0.1px;"
-        )
         subtitle = QLabel("Перетащите одну камеру на другую, чтобы поменять их местами")
-        subtitle.setStyleSheet("color: #94a3b8; font-size: 12px;")
 
         text_col = QVBoxLayout()
         text_col.setContentsMargins(0, 0, 0, 0)
@@ -250,31 +208,16 @@ class MainWindow(QMainWindow):
         text_col.addWidget(title)
         text_col.addWidget(subtitle)
 
-        # Buttons: primary (filled accent) + ghost (transparent with border)
+        # Buttons: primary (filled accent) + ghost. Both are plain QPushButtons
+        # now — the global QSS styles them via the [primary] property, so they
+        # follow the theme with no per-widget stylesheet.
         self.btn_apply = QPushButton("Применить")
+        self.btn_apply.setProperty("primary", True)
         self.btn_apply.setCursor(Qt.PointingHandCursor)
-        self.btn_apply.setStyleSheet(
-            "QPushButton {"
-            "  background: #3b82f6; color: #ffffff; border: 1px solid #3b82f6;"
-            "  padding: 7px 16px; border-radius: 7px;"
-            "  font-size: 12px; font-weight: 600;"
-            "}"
-            "QPushButton:hover { background: #2563eb; border-color: #2563eb; }"
-            "QPushButton:pressed { background: #1d4ed8; border-color: #1d4ed8; }"
-        )
         self.btn_apply.clicked.connect(self._apply_reorder)
 
         self.btn_cancel = QPushButton("Отменить")
         self.btn_cancel.setCursor(Qt.PointingHandCursor)
-        self.btn_cancel.setStyleSheet(
-            "QPushButton {"
-            "  background: transparent; color: #cbd5e1; border: 1px solid #2a3038;"
-            "  padding: 7px 16px; border-radius: 7px;"
-            "  font-size: 12px; font-weight: 500;"
-            "}"
-            "QPushButton:hover { background: #1f242b; color: #ffffff; border-color: #2f3640; }"
-            "QPushButton:pressed { background: #15181d; }"
-        )
         self.btn_cancel.clicked.connect(self._cancel_reorder)
 
         layout = QHBoxLayout(banner)
@@ -292,7 +235,41 @@ class MainWindow(QMainWindow):
         inner.addSpacing(8)
         inner.addWidget(self.btn_apply)
         layout.addLayout(inner, 1)
+
+        self._banner_parts = (banner, accent, icon, title, subtitle)
+        self._style_reorder_banner()
         return banner
+
+    def _style_reorder_banner(self) -> None:
+        """Colors for the banner, which QSS can't reach by type alone."""
+        banner, accent, icon, title, subtitle = self._banner_parts
+        banner.setStyleSheet(
+            "#ReorderBanner {"
+            f"  background: {theme.token('bg_elevated')};"
+            f"  border-bottom: 1px solid {theme.token('border_strong')};"
+            "}"
+        )
+        accent.setStyleSheet(f"background: {theme.token('accent')};")
+        icon.setStyleSheet(
+            "QLabel {"
+            f"  background: {theme.token('accent_wash')};"
+            f"  color: {theme.token('accent_soft')};"
+            "  border-radius: 8px;"
+            "  font-size: 16px;"
+            "  font-weight: 600;"
+            "}"
+        )
+        title.setStyleSheet(
+            f"color: {theme.token('text_primary')};"
+            " font-size: 13px; font-weight: 600; letter-spacing: 0.1px;"
+        )
+        subtitle.setStyleSheet(
+            f"color: {theme.token('text_muted')}; font-size: 12px;"
+        )
+
+    def _on_theme_changed(self, _mode: str) -> None:
+        self._retint_toolbar()
+        self._style_reorder_banner()
 
     # Camera ops --------------------------------------------------------
 
