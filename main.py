@@ -34,27 +34,17 @@ log = logging.getLogger(__name__)
 
 
 def _apply_theme(app: QApplication) -> None:
-    try:
-        import qdarktheme  # type: ignore
+    """Install the stylesheet + palette for the startup theme.
 
-        qdarktheme.setup_theme("dark")
-    except Exception as exc:
-        log.warning("qdarktheme unavailable (%s); falling back to Fusion+dark palette.", exc)
-        from PySide6.QtGui import QColor, QPalette
-        from PySide6.QtCore import Qt
+    Fusion is the base style in every theme: it is the only Qt style that
+    honors QSS consistently across platforms. The colors themselves come
+    from ui/theme.py, applied to the *application* (not the main window) so
+    that dialogs and the archive window inherit them too.
+    """
+    from ui.theme import theme
 
-        app.setStyle("Fusion")
-        pal = QPalette()
-        pal.setColor(QPalette.Window, QColor("#0f1115"))
-        pal.setColor(QPalette.WindowText, Qt.white)
-        pal.setColor(QPalette.Base, QColor("#15181d"))
-        pal.setColor(QPalette.AlternateBase, QColor("#1c2026"))
-        pal.setColor(QPalette.Text, Qt.white)
-        pal.setColor(QPalette.Button, QColor("#1c2026"))
-        pal.setColor(QPalette.ButtonText, Qt.white)
-        pal.setColor(QPalette.Highlight, QColor("#3b82f6"))
-        pal.setColor(QPalette.HighlightedText, Qt.white)
-        app.setPalette(pal)
+    app.setStyle("Fusion")
+    theme.apply(app, theme.initial_mode(), source="startup")
 
 
 def _install_excepthook() -> None:

@@ -1,0 +1,444 @@
+/*
+ * BelEye — global QSS TEMPLATE
+ *
+ * Rendered by ui/theme.py: every $${token} is substituted from the active
+ * token table (DARK_TOKENS / LIGHT_TOKENS / VIDEO_TOKENS) and the result is
+ * installed on the QApplication — which is what makes it reach the archive
+ * window and all dialogs, not just the main window.
+ *
+ * Rules:
+ *   - never write a literal color here, always a $${token};
+ *   - a token used here must exist in BOTH DARK_TOKENS and LIGHT_TOKENS;
+ *   - the dollar sign has no meaning in QSS, so substitution is unambiguous
+ *     (write it doubled if you ever need a literal one in a comment).
+ *
+ * Design language: tight neutral palette, single accent, small radii (6-8px),
+ * subtle 1px borders, low chroma backgrounds.
+ */
+
+QMainWindow, QDialog, QWidget {
+    background-color: ${bg_base};
+    color: ${text_primary};
+    font-family: "Inter", "SF Pro Display", "Segoe UI", "Helvetica Neue", sans-serif;
+    font-size: 13px;
+}
+
+/* ---------- Toolbar ---------- */
+
+QToolBar {
+    background: ${bg_surface};
+    border: none;
+    border-bottom: 1px solid ${border};
+    spacing: 2px;
+    padding: 6px 10px;
+}
+
+QToolBar QToolButton {
+    background: transparent;
+    color: ${text_secondary};
+    padding: 6px 12px;
+    margin: 0 1px;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 500;
+    /* Pulls the icon graphic tighter to the text — QToolButton
+       leaves a small gap (default 4 px) that varies between styles. */
+}
+QToolBar QToolButton:hover {
+    background: ${bg_hover};
+    color: ${text_hover};
+}
+QToolBar QToolButton:pressed {
+    background: ${bg_active};
+}
+QToolBar QToolButton:checked {
+    background: ${bg_active};
+    color: ${text_hover};
+}
+QToolBar QToolButton:disabled {
+    color: ${text_disabled};
+}
+QToolBar::separator {
+    background: ${border};
+    width: 1px;
+    margin: 6px 8px;
+}
+
+/* ---------- Status bar ---------- */
+
+QStatusBar {
+    background: ${bg_surface};
+    color: ${text_muted};
+    border-top: 1px solid ${border};
+    padding: 0 8px;
+    font-size: 12px;
+}
+QStatusBar::item {
+    border: none;
+}
+
+/* ---------- Buttons (generic) ---------- */
+
+QPushButton {
+    background: ${bg_hover};
+    color: ${text_primary};
+    border: 1px solid ${border_strong};
+    border-radius: 6px;
+    padding: 7px 14px;
+    font-size: 12px;
+    font-weight: 500;
+}
+QPushButton:hover {
+    background: ${bg_active};
+    border-color: ${border_stronger};
+}
+QPushButton:pressed {
+    background: ${bg_pressed};
+}
+QPushButton:disabled {
+    color: ${text_disabled};
+    background: ${bg_disabled};
+    border-color: ${border};
+}
+
+/* Primary button uses [primary=true] property */
+QPushButton[primary="true"] {
+    background: ${accent};
+    color: ${accent_fg};
+    border-color: ${accent};
+}
+QPushButton[primary="true"]:hover {
+    background: ${accent_hover};
+    border-color: ${accent_hover};
+}
+QPushButton[primary="true"]:pressed {
+    background: ${accent_pressed};
+}
+
+QPushButton[danger="true"] {
+    background: transparent;
+    color: ${danger};
+    border-color: ${danger_border};
+}
+QPushButton[danger="true"]:hover {
+    background: ${danger_bg};
+    color: ${danger_hover_fg};
+    border-color: ${danger_border_hover};
+}
+
+/* ---------- Inputs ---------- */
+
+QLineEdit, QSpinBox, QComboBox, QDateEdit, QTimeEdit, QDateTimeEdit {
+    background: ${bg_input};
+    color: ${text_primary};
+    border: 1px solid ${border_strong};
+    border-radius: 6px;
+    padding: 7px 10px;
+    font-size: 12px;
+    selection-background-color: ${accent};
+    selection-color: ${accent_fg};
+}
+QLineEdit:focus, QSpinBox:focus, QComboBox:focus,
+QDateEdit:focus, QTimeEdit:focus, QDateTimeEdit:focus {
+    border-color: ${border_focus};
+    background: ${bg_input_focus};
+}
+QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled {
+    color: ${text_disabled};
+    background: ${bg_disabled};
+}
+QComboBox::drop-down {
+    border: none;
+    width: 24px;
+}
+QComboBox QAbstractItemView {
+    background: ${bg_input};
+    color: ${text_primary};
+    border: 1px solid ${border_strong};
+    border-radius: 6px;
+    selection-background-color: ${bg_active};
+    selection-color: ${text_hover};
+    padding: 4px;
+    outline: none;
+}
+
+/* ---------- Lists ---------- */
+
+QListWidget {
+    background: ${bg_surface};
+    border: 1px solid ${border};
+    border-radius: 8px;
+    padding: 6px;
+    font-size: 13px;
+    outline: none;
+}
+QListWidget::item {
+    padding: 9px 10px;
+    border-radius: 5px;
+    color: ${text_secondary};
+}
+QListWidget::item:hover {
+    background: ${bg_hover};
+    color: ${text_hover};
+}
+QListWidget::item:selected {
+    background: ${selection_bg};
+    color: ${selection_fg};
+}
+
+/* ---------- Menus ---------- */
+
+QMenu {
+    background: ${bg_surface};
+    border: 1px solid ${border_strong};
+    border-radius: 8px;
+    padding: 5px;
+    font-size: 12px;
+}
+QMenu::item {
+    padding: 7px 18px 7px 14px;
+    border-radius: 5px;
+    color: ${text_secondary};
+}
+QMenu::item:selected {
+    background: ${bg_hover};
+    color: ${text_hover};
+}
+QMenu::item:disabled {
+    color: ${text_disabled};
+}
+QMenu::separator {
+    height: 1px;
+    background: ${border};
+    margin: 4px 6px;
+}
+
+/* ---------- Labels ---------- */
+
+QLabel {
+    color: ${text_primary};
+    background: transparent;
+}
+
+/* ---------- Tooltips ---------- */
+
+QToolTip {
+    background: ${tooltip_bg};
+    color: ${tooltip_fg};
+    border: 1px solid ${tooltip_border};
+    border-radius: 6px;
+    padding: 5px 8px;
+    font-size: 12px;
+}
+
+/* ---------- Check / radio ---------- */
+
+QCheckBox, QRadioButton {
+    color: ${text_primary};
+    spacing: 8px;
+}
+QCheckBox::indicator, QRadioButton::indicator {
+    width: 15px;
+    height: 15px;
+    border: 1px solid ${border_stronger};
+    background: ${bg_input};
+}
+QCheckBox::indicator {
+    border-radius: 4px;
+}
+QRadioButton::indicator {
+    border-radius: 8px;
+}
+QCheckBox::indicator:checked, QRadioButton::indicator:checked {
+    background: ${accent};
+    border-color: ${accent};
+}
+QCheckBox::indicator:disabled, QRadioButton::indicator:disabled {
+    background: ${bg_disabled};
+    border-color: ${border};
+}
+
+/* ---------- Group box ---------- */
+
+QGroupBox {
+    border: 1px solid ${border};
+    border-radius: 8px;
+    margin-top: 14px;
+    padding: 10px;
+    font-size: 12px;
+    font-weight: 600;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 10px;
+    padding: 0 4px;
+    color: ${text_muted};
+}
+
+/* ---------- Sliders ---------- */
+
+QSlider::groove:horizontal {
+    height: 4px;
+    background: ${bg_active};
+    border-radius: 2px;
+}
+QSlider::sub-page:horizontal {
+    background: ${accent};
+    border-radius: 2px;
+}
+QSlider::handle:horizontal {
+    background: ${accent};
+    border: none;
+    width: 12px;
+    height: 12px;
+    margin: -4px 0;
+    border-radius: 6px;
+}
+QSlider::handle:horizontal:hover {
+    background: ${accent_hover};
+}
+
+/* ---------- Calendar ----------
+ * QCalendarWidget is a navigation bar with objectName-addressed children plus
+ * a QTableView day grid; both must be styled explicitly or the widget falls
+ * back to native (wrong-theme) rendering.
+ */
+
+QCalendarWidget QWidget {
+    alternate-background-color: ${bg_surface};
+    color: ${text_primary};
+}
+QCalendarWidget QWidget#qt_calendar_navigationbar {
+    background: ${bg_surface};
+    border-bottom: 1px solid ${border};
+}
+QCalendarWidget QToolButton {
+    background: transparent;
+    color: ${text_primary};
+    border: none;
+    border-radius: 6px;
+    padding: 5px 10px;
+    margin: 3px;
+    font-size: 12px;
+    font-weight: 600;
+}
+QCalendarWidget QToolButton:hover {
+    background: ${bg_hover};
+    color: ${text_hover};
+}
+QCalendarWidget QToolButton:disabled {
+    color: ${text_disabled};
+}
+QCalendarWidget QToolButton::menu-indicator {
+    image: none;
+}
+QCalendarWidget QMenu {
+    background: ${bg_surface};
+}
+QCalendarWidget QSpinBox {
+    background: ${bg_input};
+    color: ${text_primary};
+    border: 1px solid ${border_strong};
+    border-radius: 4px;
+    margin: 3px;
+}
+QCalendarWidget QAbstractItemView {
+    background: ${bg_surface};
+    color: ${text_primary};
+    selection-background-color: ${accent};
+    selection-color: ${accent_fg};
+    outline: none;
+    border: none;
+}
+QCalendarWidget QAbstractItemView:disabled {
+    color: ${text_disabled};
+}
+QCalendarWidget QTableView {
+    gridline-color: transparent;
+}
+
+/* ---------- Scroll bars ---------- */
+
+QScrollBar:vertical {
+    background: transparent;
+    width: 10px;
+    margin: 4px 2px;
+}
+QScrollBar::handle:vertical {
+    background: ${scroll_handle};
+    border-radius: 4px;
+    min-height: 24px;
+}
+QScrollBar::handle:vertical:hover {
+    background: ${scroll_handle_hover};
+}
+QScrollBar::add-line:vertical,
+QScrollBar::sub-line:vertical {
+    height: 0;
+}
+QScrollBar::add-page:vertical,
+QScrollBar::sub-page:vertical {
+    background: transparent;
+}
+QScrollBar:horizontal {
+    background: transparent;
+    height: 10px;
+    margin: 2px 4px;
+}
+QScrollBar::handle:horizontal {
+    background: ${scroll_handle};
+    border-radius: 4px;
+    min-width: 24px;
+}
+QScrollBar::handle:horizontal:hover {
+    background: ${scroll_handle_hover};
+}
+QScrollBar::add-line:horizontal,
+QScrollBar::sub-line:horizontal {
+    width: 0;
+}
+QScrollBar::add-page:horizontal,
+QScrollBar::sub-page:horizontal {
+    background: transparent;
+}
+
+QScrollArea {
+    background: transparent;
+    border: none;
+}
+
+/* ---------- Splitter ---------- */
+
+QSplitter::handle {
+    background: ${border};
+}
+QSplitter::handle:hover {
+    background: ${border_stronger};
+}
+
+/* ---------- Dialog ---------- */
+
+QDialog {
+    background: ${bg_base};
+}
+QDialogButtonBox QPushButton {
+    min-width: 84px;
+}
+QMessageBox {
+    background: ${bg_base};
+}
+QMessageBox QLabel {
+    color: ${text_primary};
+}
+
+/* ---------- Video surfaces ----------
+ * Always dark, in BOTH themes, by design: a light backdrop washes out the
+ * OSD overlays painted on top of the decoded frame. See ui/theme.py.
+ */
+
+QWidget#CameraTile {
+    background: ${video_bg};
+}
+QWidget#VideoSurface {
+    background: ${video_bg};
+}

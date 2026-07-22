@@ -161,7 +161,6 @@ class MainWindow(QMainWindow):
         self._build_toolbar()
         self.setStatusBar(QStatusBar())
 
-        self._load_qss()
         self._reload_cameras()
 
     # Toolbar / banner --------------------------------------------------
@@ -294,14 +293,6 @@ class MainWindow(QMainWindow):
         inner.addWidget(self.btn_apply)
         layout.addLayout(inner, 1)
         return banner
-
-    def _load_qss(self) -> None:
-        qss_path = Path(__file__).resolve().parent.parent / "resources" / "styles.qss"
-        if qss_path.exists():
-            try:
-                self.setStyleSheet(qss_path.read_text(encoding="utf-8"))
-            except OSError as exc:
-                log.warning("Failed to load QSS: %s", exc)
 
     # Camera ops --------------------------------------------------------
 
