@@ -16,6 +16,7 @@ from dvrip.sofia_frame import SofiaFrameParser, detect_codec
 from video.ffmpeg_player import FFmpegPlayer
 
 from .camera_widget import _Overlay, _NameProxy, DraggableTileMixin
+from .prefs import prefs
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +39,10 @@ class NvrChannelTile(DraggableTileMixin, QFrame):
     reconnectRequested = Signal(str)   # emitted with tile_id
     swapRequested = Signal(str, str)   # source tile_id, target tile_id
     archiveRequested = Signal(str, int)  # nvr_id, channel_number
+    # [hq] Emitted exactly once per set_preferred_stream() call — on success,
+    # on abort, and on the no-op paths. GridView serializes switching by
+    # waiting for this, so a request that never replied would wedge the queue.
+    streamSwitched = Signal(str, str)  # tile_id, resulting stream
 
     @property
     def drag_id(self) -> str:
@@ -94,8 +99,11 @@ class NvrChannelTile(DraggableTileMixin, QFrame):
         self._stopped = True
         # [FIX quality] Current live stream type ("Extra1" grid / "Main"
         # focused). Applied at OPMonitor claim time; switchable at runtime.
+        # [hq] With "high quality everywhere" on, a tile is BORN on Main, so
+        # neither a fresh start nor a reconnect costs an extra switch.
         self._current_stream = (
-            "Extra1" if getattr(nvr, "prefer_substream", True) else "Main"
+            "Main" if prefs.hq_all()
+            else ("Extra1" if getattr(nvr, "prefer_substream", True) else "Main")
         )
         self._reconnect_idx = 0
         self._reconnect_backoff_ms = [3000, 5000, 10000, 30000]
@@ -189,15 +197,20 @@ class NvrChannelTile(DraggableTileMixin, QFrame):
         sub stream, 1920 px for Main.
         """
         if stream == self._current_stream and self._switch_target is None:
+            self.streamSwitched.emit(self._tile_id, self._current_stream)
             return
         if self._stopped or self._client is None:
+            # Not streaming: just record the preference, it is applied at the
+            # next claim.
             self._current_stream = stream
+            self.streamSwitched.emit(self._tile_id, stream)
             return
         if self._switch_target == stream:
-            return  # this exact switch already warming up
+            return  # this exact switch already warming up; it will reply
         if self._switch_target is not None:
             self._abort_switch()  # supersede an in-flight switch
         if stream == self._current_stream:
+            self.streamSwitched.emit(self._tile_id, self._current_stream)
             return
 
         # [FIX seamless2] Make-before-break: the CURRENT pipeline keeps
@@ -291,6 +304,8 @@ class NvrChannelTile(DraggableTileMixin, QFrame):
         self._switch_target = None
 
         new_player.show()
+        log.info("[hq] tile %s switched to %s", self._tile_id, stream)
+        self.streamSwitched.emit(self._tile_id, stream)
         # Tear the OLD pipeline down only after the new one is visible.
         if old_player is not None:
             self.layout().removeWidget(old_player)
@@ -327,6 +342,7 @@ class NvrChannelTile(DraggableTileMixin, QFrame):
             wp.stop()
             wp.deleteLater()
         self._switch_parser = None
+        self.streamSwitched.emit(self._tile_id, self._current_stream)
 
     # ----- DVRIP wiring ------------------------------------------------
 

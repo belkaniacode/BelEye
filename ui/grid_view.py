@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+from collections import deque
 from typing import Optional
 
 from PySide6.QtCore import Qt, Signal
@@ -11,6 +12,7 @@ from app.config import CameraConfig
 from app.nvr_config import NvrConfig
 from .camera_widget import CameraTile
 from .nvr_channel_widget import NvrChannelTile, nvr_tile_id
+from .prefs import KEY_HQ_ALL, prefs
 from .theme import theme
 
 log = logging.getLogger(__name__)
@@ -37,6 +39,10 @@ class GridView(QWidget):
         self._focused: Optional[str] = None
         self._reorder_mode = False
         self._order_snapshot: list[str] = []
+        # [hq] Serialized stream-quality switching — see apply_quality_policy.
+        self._switch_queue: deque[tuple[str, str]] = deque()
+        self._switching: Optional[str] = None
+        prefs.changed.connect(self._on_prefs_changed)
 
         self._stack = QStackedLayout(self)
         self._stack.setContentsMargins(0, 0, 0, 0)
@@ -159,6 +165,7 @@ class GridView(QWidget):
                 tile.reconnectRequested.connect(self._on_reconnect)
                 tile.swapRequested.connect(self._on_swap)
                 tile.archiveRequested.connect(self.archiveRequested)
+                tile.streamSwitched.connect(self._on_stream_switched)
                 if self._reorder_mode:
                     tile.set_reorder_mode(True)
                 self._tiles[tid] = tile
@@ -177,35 +184,88 @@ class GridView(QWidget):
                 existing._overlay.set_name(f"{nvr.name} · {channel.name}")
                 if changed:
                     existing.reload_credentials()
+        self.apply_quality_policy()
         self._relayout()
 
+    def _on_prefs_changed(self, key: str, _value: object) -> None:
+        if key == KEY_HQ_ALL:
+            self.apply_quality_policy()
+
     def show_grid(self) -> None:
-        # [FIX quality] Returning to the grid drops the previously focused
-        # tile back to the sub stream so the NVR encoder isn't loaded with
-        # a Main-stream session nobody is looking at full-size.
-        prev = self._tiles.get(self._focused) if self._focused else None
-        if prev is not None and hasattr(prev, "set_preferred_stream"):
-            prev.set_preferred_stream("Extra1")
         self._mode = self.MODE_GRID
         self._focused = None
+        self.apply_quality_policy()
         self._relayout()
 
     def show_single(self, camera_id: str) -> None:
         if camera_id not in self._tiles:
             return
-        # [FIX quality] Focused tile upgrades to the Main stream (full
-        # resolution). Only the ONE focused tile does this — the others
-        # keep their cheap sub-stream sessions.
-        prev = self._tiles.get(self._focused) if self._focused else None
-        if prev is not None and prev is not self._tiles[camera_id] \
-                and hasattr(prev, "set_preferred_stream"):
-            prev.set_preferred_stream("Extra1")
-        tile = self._tiles[camera_id]
-        if hasattr(tile, "set_preferred_stream"):
-            tile.set_preferred_stream("Main")
         self._mode = self.MODE_SINGLE
         self._focused = camera_id
+        self.apply_quality_policy()
         self._relayout()
+
+    # Quality policy -------------------------------------------------------
+
+    def _target_stream(self, tile_id: str) -> str:
+        """Which live stream this tile should be on right now.
+
+        With "high quality everywhere" on, every tile sits on Main — which is
+        the point: expanding a tile then changes nothing at all, no re-claim
+        and no decoder restart. Otherwise only the focused tile gets Main, so
+        the NVR encoder isn't loaded with full-resolution sessions nobody is
+        looking at full-size.
+        """
+        if prefs.hq_all():
+            return "Main"
+        return "Main" if tile_id == self._focused else "Extra1"
+
+    def apply_quality_policy(self) -> None:
+        """Bring every tile to its target stream, one switch at a time.
+
+        Switching is make-before-break, so a tile briefly holds two DVRIP
+        sessions. Four tiles switching together would be eight sessions —
+        past the point where this NVR starts rejecting claims. Hence the
+        queue: exactly one switch is in flight at any moment.
+        """
+        wanted: list[tuple[str, str]] = []
+        for tile_id, tile in self._tiles.items():
+            if not hasattr(tile, "set_preferred_stream"):
+                continue  # RTSP tile — single URL, no stream concept
+            target = self._target_stream(tile_id)
+            if getattr(tile, "_current_stream", target) != target:
+                wanted.append((tile_id, target))
+
+        # Recompute from scratch rather than appending: the policy may have
+        # flipped while an older queue was still draining.
+        self._switch_queue = deque(wanted)
+        if wanted:
+            log.info("[hq] quality policy: %d tile(s) to switch", len(wanted))
+        if self._switching is None:
+            self._start_next_switch()
+
+    def _start_next_switch(self) -> None:
+        while self._switch_queue:
+            tile_id, target = self._switch_queue.popleft()
+            tile = self._tiles.get(tile_id)
+            if tile is None or not hasattr(tile, "set_preferred_stream"):
+                continue  # tile removed while queued
+            if getattr(tile, "_current_stream", target) == target:
+                continue  # already there (e.g. reconnected onto the target)
+            self._switching = tile_id
+            tile.set_preferred_stream(target)
+            return
+        if self._switching is not None:
+            log.info("[hq] quality policy: queue drained")
+        self._switching = None
+
+    def _on_stream_switched(self, tile_id: str, _stream: str) -> None:
+        # Fires on success, on abort and on the no-op paths, so the queue
+        # always advances — a failed switch must not wedge it.
+        if tile_id != self._switching:
+            return
+        self._switching = None
+        self._start_next_switch()
 
     def toggle_mode(self) -> None:
         if self._mode == self.MODE_SINGLE:
