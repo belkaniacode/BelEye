@@ -150,6 +150,8 @@ class FFmpegPlayer(QWidget):
         # multi-tile grid; a focused/maximized tile raises it (with the Main
         # stream) for full quality. Changing it at runtime restarts ffmpeg.
         self._output_width: int = 640
+        #: Number of ffmpeg spawns; see _start_process.
+        self.process_starts: int = 0
 
         # Widget chrome. The video surface stays dark in BOTH themes by
         # design — a light backdrop washes out the OSD overlays painted on
@@ -281,6 +283,10 @@ class FFmpegPlayer(QWidget):
             self._on_failure("ffmpeg not installed")
             return
 
+        # Counts decoder spawns for this widget. A stream switch or a
+        # resolution change restarts ffmpeg, and "did the decoder restart?"
+        # is otherwise only inferable from the log.
+        self.process_starts += 1
         log.info("[FIX] Spawning ffmpeg for %s", self._safe_url())
 
         # Reset per-attempt state

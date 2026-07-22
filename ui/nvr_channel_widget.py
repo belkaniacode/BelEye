@@ -20,6 +20,34 @@ from .prefs import prefs
 
 log = logging.getLogger(__name__)
 
+# [hq] Decode-output width caps, in pixels of the image handed back to Qt.
+#
+# The constraint is NOT ffmpeg's CPU (it idles around 48%) — it is the raw
+# BGR frames travelling back into the GUI thread, which has to memcpy and
+# repaint every one of them. At 1920 that is 6.2 MB per frame per tile; four
+# tiles saturate the main thread, ffmpeg blocks on stdout, stops draining its
+# stdin, and our 2 MB backpressure guard restarts the decoder every ~30 s.
+#
+# Measured on the 4-channel test rig (90 s soak, 4 tiles on Main):
+#   1920 -> 4 backpressure drops, 3 decoder restarts
+#   1440 -> clean
+#   1280 -> clean
+#    960 -> clean
+# 1440 is the highest measured-clean value, so that is the cap while "high
+# quality everywhere" is on. It is also deliberately the SAME in the grid and
+# expanded: a width change restarts ffmpeg, and "expanding never reloads" is
+# the whole point of the feature.
+WIDTH_SUB = 640
+WIDTH_MAIN = 1920
+WIDTH_MAIN_HQ_ALL = 1440
+
+
+def _output_width_for(stream: str) -> int:
+    if stream != "Main":
+        return WIDTH_SUB
+    return WIDTH_MAIN_HQ_ALL if prefs.hq_all() else WIDTH_MAIN
+
+
 
 def nvr_tile_id(nvr_id: str, channel: int) -> str:
     """Stable id used by GridView as the dict key for an NVR-channel tile."""
@@ -223,7 +251,7 @@ class NvrChannelTile(DraggableTileMixin, QFrame):
         self._overlay.set_busy(True)
 
         wp = FFmpegPlayer(parent=self, input_mode="pipe", input_codec="h264")
-        wp.set_output_width(640 if stream != "Main" else 1920)
+        wp.set_output_width(_output_width_for(stream))
         wp.hide()
         self.layout().addWidget(wp)
         wp.streamUp.connect(self._complete_switch)
@@ -374,7 +402,7 @@ class NvrChannelTile(DraggableTileMixin, QFrame):
             "[FIX perf] tile %s login ok; starting OPMonitor ch=%d stream=%s",
             self._tile_id, self.channel.number, stream,
         )
-        self.player.set_output_width(640 if stream != "Main" else 1920)
+        self.player.set_output_width(_output_width_for(stream))
         self._client.start_monitor(self.channel.number, stream_type=stream)
         # [FIX freeze] Arm the stall watchdog with a fresh baseline: if no
         # video chunk arrives within the stall window (even the FIRST one),
