@@ -11,6 +11,7 @@ from app.config import CameraConfig
 from app.nvr_config import NvrConfig
 from .camera_widget import CameraTile
 from .nvr_channel_widget import NvrChannelTile, nvr_tile_id
+from .theme import theme
 
 log = logging.getLogger(__name__)
 
@@ -51,12 +52,18 @@ class GridView(QWidget):
         self._single_layout.setContentsMargins(0, 0, 0, 0)
 
         self._empty = QLabel("Камеры не настроены.\nОткройте «Настройки» и добавьте RTSP-камеру.")
-        self._empty.setStyleSheet("color: #94a3b8; font-size: 16px;")
+        self._style_empty()
+        theme.changed.connect(lambda _m: self._style_empty())
         self._empty.setAlignment(Qt.AlignCenter)
 
         self._stack.addWidget(self._grid_container)  # index 0
         self._stack.addWidget(self._single_container)  # index 1
         self._stack.addWidget(self._empty)  # index 2
+
+    def _style_empty(self) -> None:
+        self._empty.setStyleSheet(
+            f"color: {theme.token('text_muted')}; font-size: 16px;"
+        )
 
     # Public -------------------------------------------------------------
 

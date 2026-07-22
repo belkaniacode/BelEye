@@ -81,9 +81,12 @@ DARK_TOKENS: dict[str, str] = {
     "text_disabled": "#475569",
     "text_hover": "#ffffff",
     # accent
-    "accent": "#3b82f6",
-    "accent_hover": "#2563eb",
-    "accent_pressed": "#1d4ed8",
+    # blue-600, not blue-500: white on #3b82f6 is only 3.68:1, below AA.
+    # The vivid blue-500 survives as border_focus (a non-text UI component,
+    # judged against 3:1) and as video_accent on the dark tile overlays.
+    "accent": "#2563eb",
+    "accent_hover": "#1d4ed8",
+    "accent_pressed": "#1e40af",
     "accent_fg": "#ffffff",
     "accent_soft": "#60a5fa",
     "accent_wash": "rgba(59, 130, 246, 0.12)",
@@ -97,6 +100,7 @@ DARK_TOKENS: dict[str, str] = {
     "danger_border_hover": "#3a1f25",
     "danger_hover_fg": "#fca5a5",
     "warning": "#eab308",
+    "warning_fill": "#eab308",
     "warning_fg": "#0b0d10",
     "success": "#22c55e",
     # scrollbars
@@ -149,7 +153,8 @@ LIGHT_TOKENS: dict[str, str] = {
     "danger_border": "#fecaca",
     "danger_border_hover": "#fca5a5",
     "danger_hover_fg": "#b91c1c",
-    "warning": "#a16207",        # 4.7:1 as text; amber fills use warning_fg on top
+    "warning": "#a16207",        # 4.7:1 as text
+    "warning_fill": "#eab308",   # amber badge fill; pair with warning_fg on top
     "warning_fg": "#0b0d10",
     "success": "#15803d",        # 4.8:1
     # scrollbars
@@ -178,10 +183,6 @@ VIDEO_TOKENS: dict[str, str] = {
     "video_status_connecting": "#eab308",
     "video_status_down": "#ef4444",
     "video_status_unknown": "#6b7280",
-    "video_track": "#1b2129",
-    "video_track_border": "#3a424d",
-    "video_progress": "#2563eb",
-    "video_marker": "#ef4444",
 }
 
 

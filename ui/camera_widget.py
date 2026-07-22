@@ -19,16 +19,24 @@ from app.config import CameraConfig
 from app.rtsp import build_rtsp_url
 from app.secrets import get_password
 from video.ffmpeg_player import FFmpegPlayer
+from .theme import theme
 
 log = logging.getLogger(__name__)
 
 
-STATUS_COLORS = {
-    "live": QColor("#22c55e"),
-    "connecting": QColor("#eab308"),
-    "down": QColor("#ef4444"),
-    "unknown": QColor("#6b7280"),
+# Overlay colors come from the VIDEO_* token family, which is identical in
+# both themes on purpose: these are painted on top of a decoded frame, and
+# the tile background stays dark whatever the chrome does. See ui/theme.py.
+_STATUS_TOKENS = {
+    "live": "video_status_live",
+    "connecting": "video_status_connecting",
+    "down": "video_status_down",
+    "unknown": "video_status_unknown",
 }
+
+
+def _status_color(status: str) -> QColor:
+    return theme.color(_STATUS_TOKENS.get(status, "video_status_unknown"))
 
 
 class _Overlay(QWidget):
@@ -130,17 +138,17 @@ class _Overlay(QWidget):
         # widgets (player) can't cover it.
         if self._drop_target:
             # Bright dashed accent — clear visual "drop here" affordance
-            pen = QPen(QColor("#22c55e"), 3, Qt.DashLine)
+            pen = QPen(theme.color("video_select"), 3, Qt.DashLine)
             p.setPen(pen)
             p.drawRect(2, 2, self.width() - 5, self.height() - 5)
             # tinted overlay
             p.fillRect(self.rect(), QColor(34, 197, 94, 40))
         elif self._reorder:
-            pen = QPen(QColor("#3b82f6"), 2, Qt.DashLine)
+            pen = QPen(theme.color("video_accent"), 2, Qt.DashLine)
             p.setPen(pen)
             p.drawRect(2, 2, self.width() - 5, self.height() - 5)
         elif self._hovered:
-            pen = QPen(QColor("#3b82f6"), 2)
+            pen = QPen(theme.color("video_accent"), 2)
             p.setPen(pen)
             inset = 1
             p.drawRect(
@@ -171,7 +179,7 @@ class _Overlay(QWidget):
             p.setPen(Qt.NoPen)
             p.setBrush(QColor(0, 0, 0, 170))
             p.drawRoundedRect(x, y, handle_w, handle_h, 4, 4)
-            p.setPen(QColor("#ffffff"))
+            p.setPen(theme.color("video_overlay_fg"))
             font = QFont()
             font.setPointSize(11)
             font.setBold(True)
@@ -196,12 +204,12 @@ class _Overlay(QWidget):
             bx, by = 10, 10
             # Filled red pill — unmistakable
             p.setPen(Qt.NoPen)
-            p.setBrush(QColor("#dc2626"))
+            p.setBrush(theme.color("video_rec"))
             p.drawRoundedRect(bx, by, badge_w, badge_h, badge_h // 2, badge_h // 2)
             # White dot inside the pill
-            p.setBrush(QColor("#ffffff"))
+            p.setBrush(theme.color("video_overlay_fg"))
             p.drawEllipse(bx + pad_x, by + (badge_h - dot_d) // 2, dot_d, dot_d)
-            p.setPen(QColor("#ffffff"))
+            p.setPen(theme.color("video_overlay_fg"))
             p.drawText(
                 QRect(bx + pad_x + dot_d + gap, by, text_w + 4, badge_h),
                 Qt.AlignVCenter | Qt.AlignLeft,
@@ -228,7 +236,7 @@ class _Overlay(QWidget):
             p.setPen(Qt.NoPen)
             p.setBrush(QColor(15, 23, 42, 220))  # near-black translucent pill
             p.drawRoundedRect(bx, by, badge_w, badge_h, badge_h // 2, badge_h // 2)
-            p.setPen(QColor("#fef3c7"))  # amber-50 — high contrast
+            p.setPen(theme.color("video_name_fg"))  # amber-50 — high contrast
             p.drawText(
                 QRect(bx, by, badge_w, badge_h),
                 Qt.AlignCenter,
@@ -239,7 +247,7 @@ class _Overlay(QWidget):
             return
 
         # Status dot (bottom-right)
-        dot_color = STATUS_COLORS.get(self._status, STATUS_COLORS["unknown"])
+        dot_color = _status_color(self._status)
         dot_d = 10
         margin = 8
         dot_rect = QRect(
@@ -266,7 +274,7 @@ class _Overlay(QWidget):
             p.setPen(QColor(0, 0, 0, 180))
             p.drawText(x + 1, y + 1, self._name)
             # body — slightly off-white for less contrast harshness
-            p.setPen(QColor("#f1f5f9"))
+            p.setPen(theme.color("video_text"))
             p.drawText(x, y, self._name)
 
 
@@ -407,7 +415,8 @@ class CameraTile(DraggableTileMixin, QFrame):
         # carries only the dark background; no QSS border (would be hidden
         # by the child widgets anyway).
         self.setMouseTracking(True)
-        self.setStyleSheet("#CameraTile { background: #0b0d10; }")
+        # Background comes from the global QSS rule for #CameraTile
+        # (video_bg — dark in both themes by design).
 
         self._init_drag()
 

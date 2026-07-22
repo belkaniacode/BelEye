@@ -21,6 +21,8 @@ from PySide6.QtWidgets import (
 from app.config import CameraConfig
 from app.rtsp import build_rtsp_url
 from video.stream_monitor import probe_rtsp
+from .icon_util import eye_icon
+from .theme import theme
 
 log = logging.getLogger(__name__)
 
@@ -72,19 +74,12 @@ class CameraForm(QDialog):
 
         # [FIX icons] Painted eye icon — the previous "👁" emoji rendered as
         # a tofu box on systems without an emoji font.
-        from ui.icon_util import eye_icon
-        show_pass = QPushButton()
-        show_pass.setIcon(eye_icon(slashed=True))
-        show_pass.setCheckable(True)
-        show_pass.setFixedWidth(34)
-        show_pass.setToolTip("Показать пароль")
-        show_pass.setCursor(Qt.PointingHandCursor)
-
-        def _toggle_pass(on: bool) -> None:
-            self.pass_edit.setEchoMode(QLineEdit.Normal if on else QLineEdit.Password)
-            show_pass.setIcon(eye_icon(slashed=not on))
-            show_pass.setToolTip("Скрыть пароль" if on else "Показать пароль")
-        show_pass.toggled.connect(_toggle_pass)
+        self._show_pass = QPushButton()
+        self._show_pass.setCheckable(True)
+        self._show_pass.setFixedWidth(34)
+        self._show_pass.setCursor(Qt.PointingHandCursor)
+        self._show_pass.toggled.connect(self._toggle_pass)
+        show_pass = self._show_pass
         pass_row = QHBoxLayout()
         pass_row.setContentsMargins(0, 0, 0, 0)
         pass_row.addWidget(self.pass_edit)
@@ -105,7 +100,9 @@ class CameraForm(QDialog):
         self.test_btn.clicked.connect(self._on_test)
         self.test_status = QLabel("")
         self.test_status.setWordWrap(True)
-        self.test_status.setStyleSheet("color: #94a3b8;")
+        # Status color is semantic, so it has to be re-resolved on a theme
+        # flip — remember which state we are in.
+        self._status_token = "text_muted"
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         ok_btn = buttons.button(QDialogButtonBox.Ok)
@@ -128,6 +125,24 @@ class CameraForm(QDialog):
         layout.addStretch(1)
         layout.addWidget(buttons)
 
+        self._apply_theme()
+        theme.changed.connect(lambda _m: self._apply_theme())
+
+    def _toggle_pass(self, on: bool) -> None:
+        self.pass_edit.setEchoMode(QLineEdit.Normal if on else QLineEdit.Password)
+        self._show_pass.setToolTip("Скрыть пароль" if on else "Показать пароль")
+        self._apply_theme()
+
+    def _apply_theme(self) -> None:
+        # QIcon bakes its color into a pixmap, so it must be rebuilt.
+        self._show_pass.setIcon(eye_icon(slashed=not self._show_pass.isChecked()))
+        self.test_status.setStyleSheet(f"color: {theme.token(self._status_token)};")
+
+    def _set_status(self, text: str, token: str) -> None:
+        self._status_token = token
+        self.test_status.setText(text)
+        self.test_status.setStyleSheet(f"color: {theme.token(token)};")
+
     def _collect(self) -> tuple[CameraConfig, str]:
         cam = CameraConfig(
             id=self._camera.id,
@@ -146,11 +161,10 @@ class CameraForm(QDialog):
             return
         cam, pwd = self._collect()
         if not cam.host:
-            self.test_status.setText("Укажите хост.")
+            self._set_status("Укажите хост.", "danger")
             return
         url = build_rtsp_url(cam, pwd)
-        self.test_status.setStyleSheet("color: #94a3b8;")
-        self.test_status.setText("Проверка...")
+        self._set_status("Проверка...", "text_muted")
         self.test_btn.setEnabled(False)
 
         # [FIX] Run probe in a QThread so the GUI keeps responding
@@ -163,11 +177,9 @@ class CameraForm(QDialog):
 
     def _on_probe_done(self, ok: bool, info: str) -> None:
         if ok:
-            self.test_status.setStyleSheet("color: #22c55e;")
-            self.test_status.setText(f"OK — {info}")
+            self._set_status(f"OK — {info}", "success")
         else:
-            self.test_status.setStyleSheet("color: #ef4444;")
-            self.test_status.setText(f"Ошибка: {info}")
+            self._set_status(f"Ошибка: {info}", "danger")
         self.test_btn.setEnabled(True)
         if self._probe_thread is not None:
             self._probe_thread.quit()

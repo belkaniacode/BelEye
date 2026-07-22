@@ -23,6 +23,7 @@ from app.config import CameraConfig
 from app.nvr_config import NvrConfig, nvr_keyring_user
 from .camera_form import CameraForm
 from .nvr_form import NvrForm
+from .theme import theme
 
 log = logging.getLogger(__name__)
 
@@ -43,16 +44,16 @@ class SettingsDialog(QDialog):
         self.list = QListWidget()
         self.list.itemDoubleClicked.connect(lambda _i: self._edit())
 
-        title = QLabel("Источники")
-        title.setStyleSheet("font-size: 16px; font-weight: 600; color: #f1f5f9;")
+        self._title = QLabel("Источники")
         self._subtitle = QLabel("")
-        self._subtitle.setStyleSheet("font-size: 12px; color: #94a3b8;")
+        self._apply_theme()
+        theme.changed.connect(lambda _m: self._apply_theme())
         self._refresh_list()
 
         header = QVBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
         header.setSpacing(2)
-        header.addWidget(title)
+        header.addWidget(self._title)
         header.addWidget(self._subtitle)
 
         add_cam_btn = QPushButton("Добавить камеру")
@@ -101,6 +102,14 @@ class SettingsDialog(QDialog):
         root.addLayout(header)
         root.addLayout(body, 1)
         root.addWidget(buttons)
+
+    def _apply_theme(self) -> None:
+        self._title.setStyleSheet(
+            f"font-size: 16px; font-weight: 600; color: {theme.token('text_primary')};"
+        )
+        self._subtitle.setStyleSheet(
+            f"font-size: 12px; color: {theme.token('text_muted')};"
+        )
 
     # ---------------- list ----------------
 

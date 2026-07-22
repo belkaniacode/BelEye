@@ -59,7 +59,7 @@ class NvrChannelTile(DraggableTileMixin, QFrame):
         self.setObjectName("CameraTile")
         self.setFrameShape(QFrame.NoFrame)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.setStyleSheet("#CameraTile { background: #0b0d10; }")
+        # Background: global QSS rule for #CameraTile (video_bg).
         self.setMouseTracking(True)
 
         # Pipe-mode player: ffmpeg reads H.264 elementary stream from stdin.

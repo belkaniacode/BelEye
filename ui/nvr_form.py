@@ -21,6 +21,8 @@ from PySide6.QtWidgets import (
 
 from app.nvr_config import NvrChannel, NvrConfig
 from dvrip.client import DvripClient
+from .icon_util import eye_icon
+from .theme import theme
 
 log = logging.getLogger(__name__)
 
@@ -56,19 +58,12 @@ class NvrForm(QDialog):
 
         # [FIX icons] Painted eye icon — the previous "👁" emoji rendered as
         # a tofu box on systems without an emoji font.
-        from ui.icon_util import eye_icon
-        show_pass = QPushButton()
-        show_pass.setIcon(eye_icon(slashed=True))
-        show_pass.setCheckable(True)
-        show_pass.setFixedWidth(34)
-        show_pass.setToolTip("Показать пароль")
-        show_pass.setCursor(Qt.PointingHandCursor)
-
-        def _toggle_pass(on: bool) -> None:
-            self.pass_edit.setEchoMode(QLineEdit.Normal if on else QLineEdit.Password)
-            show_pass.setIcon(eye_icon(slashed=not on))
-            show_pass.setToolTip("Скрыть пароль" if on else "Показать пароль")
-        show_pass.toggled.connect(_toggle_pass)
+        self._show_pass = QPushButton()
+        self._show_pass.setCheckable(True)
+        self._show_pass.setFixedWidth(34)
+        self._show_pass.setCursor(Qt.PointingHandCursor)
+        self._show_pass.toggled.connect(self._toggle_pass)
+        show_pass = self._show_pass
         pass_row = QHBoxLayout()
         pass_row.setContentsMargins(0, 0, 0, 0)
         pass_row.addWidget(self.pass_edit)
@@ -91,7 +86,8 @@ class NvrForm(QDialog):
             "Введите данные и нажмите «Проверить соединение»."
         )
         self.test_status.setWordWrap(True)
-        self.test_status.setStyleSheet("color: #94a3b8;")
+        # Semantic status color; remembered so a theme flip can re-resolve it.
+        self._status_token = "success" if self._nvr.channels else "text_muted"
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         ok_btn = buttons.button(QDialogButtonBox.Ok)
@@ -113,6 +109,19 @@ class NvrForm(QDialog):
 
         self._client: DvripClient | None = None
         self._timeout_timer: QTimer | None = None
+
+        self._apply_theme()
+        theme.changed.connect(lambda _m: self._apply_theme())
+
+    def _toggle_pass(self, on: bool) -> None:
+        self.pass_edit.setEchoMode(QLineEdit.Normal if on else QLineEdit.Password)
+        self._show_pass.setToolTip("Скрыть пароль" if on else "Показать пароль")
+        self._apply_theme()
+
+    def _apply_theme(self) -> None:
+        # QIcon bakes its color into a pixmap, so it must be rebuilt.
+        self._show_pass.setIcon(eye_icon(slashed=not self._show_pass.isChecked()))
+        self.test_status.setStyleSheet(f"color: {theme.token(self._status_token)};")
 
     # ---------------- probe ----------------
 
@@ -181,8 +190,14 @@ class NvrForm(QDialog):
             self._client = None
 
     def _set_status(self, text: str, *, error: bool) -> None:
-        color = "#ef4444" if error else "#22c55e" if "Найдено" in text or "ok" in text.lower() else "#94a3b8"
-        self.test_status.setStyleSheet(f"color: {color};")
+        if error:
+            token = "danger"
+        elif "Найдено" in text or "ok" in text.lower():
+            token = "success"
+        else:
+            token = "text_muted"
+        self._status_token = token
+        self.test_status.setStyleSheet(f"color: {theme.token(token)};")
         self.test_status.setText(text)
 
     # ---------------- accept ----------------

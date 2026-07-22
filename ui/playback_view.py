@@ -25,7 +25,7 @@ import time as time_mod
 from datetime import datetime, time, timedelta
 
 from PySide6.QtCore import QDate, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QPainter, QTextCharFormat
+from PySide6.QtGui import QPainter, QTextCharFormat
 from PySide6.QtWidgets import (
     QCalendarWidget,
     QHBoxLayout,
@@ -44,6 +44,7 @@ from dvrip.client import DvripClient, FileRecord
 from dvrip.sofia_frame import SofiaFrameParser, detect_codec
 from video.export import MP4Exporter
 from video.ffmpeg_player import FFmpegPlayer
+from .theme import theme
 
 log = logging.getLogger(__name__)
 
@@ -60,6 +61,10 @@ class _DayTimeline(QWidget):
         self._day: QDate = QDate.currentDate()
         self._records: list[FileRecord] = []
         self._cursor: datetime | None = None
+        # The timeline is a control, not a video surface — it follows the
+        # chrome theme. Colors are read at paint time, so a repaint is all
+        # a theme switch needs.
+        theme.changed.connect(lambda _m: self.update())
 
     def set_day(self, day: QDate, records: list[FileRecord]) -> None:
         self._day = day
@@ -75,22 +80,22 @@ class _DayTimeline(QWidget):
 
     def paintEvent(self, event) -> None:  # noqa: N802
         p = QPainter(self)
-        p.fillRect(self.rect(), QColor("#0f1115"))
+        p.fillRect(self.rect(), theme.color("bg_surface"))
         track_top, track_h = 14, 18
         w = self.width()
         # base track
         p.setPen(Qt.NoPen)
-        p.setBrush(QColor("#1b2129"))
+        p.setBrush(theme.color("bg_active"))
         p.drawRect(0, track_top, w, track_h)
         # hour ticks + labels (every 3h)
-        p.setPen(QColor("#3a424d"))
+        p.setPen(theme.color("text_muted"))
         for h in range(0, 25, 3):
             x = self._x_for(h / 24.0)
             p.drawLine(x, track_top, x, track_top + track_h)
             p.drawText(min(max(x - 12, 0), w - 24), track_top + track_h + 12, f"{h:02d}:00")
         # record blocks
         day_start = datetime.combine(self._day.toPython(), time.min)
-        p.setBrush(QColor("#2563eb"))
+        p.setBrush(theme.color("accent"))
         p.setPen(Qt.NoPen)
         for rec in self._records:
             f0 = max(0.0, (rec.begin - day_start).total_seconds() / 86400.0)
@@ -104,7 +109,7 @@ class _DayTimeline(QWidget):
             frac = (self._cursor - day_start).total_seconds() / 86400.0
             if 0 <= frac <= 1:
                 x = self._x_for(frac)
-                p.setPen(QColor("#ef4444"))
+                p.setPen(theme.color("danger_strong"))
                 p.drawLine(x, track_top - 4, x, track_top + track_h + 4)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
@@ -251,7 +256,6 @@ class PlaybackView(QWidget):
         self.btn_close.setToolTip("Закрыть окно архива (Esc)")
         self.btn_close.clicked.connect(self.close)
         self._status = QLabel("Выберите запись в списке или кликните по таймлайну.")
-        self._status.setStyleSheet("color: #94a3b8;")
 
         transport = QHBoxLayout()
         transport.addWidget(self.btn_play)
@@ -278,6 +282,9 @@ class PlaybackView(QWidget):
         root.setSpacing(12)
         root.addWidget(left_w)
         root.addWidget(right_w, 1)
+
+        self._apply_theme()
+        theme.changed.connect(lambda _m: self._apply_theme())
 
         # [FIX speed2] Speed levels as DVRIP Fast/Slow steps relative to 1×.
         # Fast doubles, Slow halves. ffmpeg now uses trick-play decode flags
@@ -431,14 +438,16 @@ class PlaybackView(QWidget):
         # "muted other-month" cells. We now paint a coloured background pill
         # so days with recordings are *unmistakable*.
         normal_fmt = QTextCharFormat()
-        normal_fmt.setForeground(QColor("#ffffff"))
-        normal_fmt.setBackground(QColor("#1e40af"))   # bold blue background
+        normal_fmt.setForeground(theme.color("accent_fg"))
+        normal_fmt.setBackground(theme.color("accent_pressed"))  # deep blue pill
         normal_fmt.setFontWeight(75)
         # Days that have any event-triggered (motion/alarm/human) records get
         # an accent so the user can spot incident days at a glance.
         event_fmt = QTextCharFormat()
-        event_fmt.setForeground(QColor("#0b0d10"))
-        event_fmt.setBackground(QColor("#eab308"))    # amber for incident day
+        # warning_fill (not warning) — this is a filled badge, and the amber
+        # fill stays the same in both themes so warning_fg reads on top of it.
+        event_fmt.setForeground(theme.color("warning_fg"))
+        event_fmt.setBackground(theme.color("warning_fill"))
         event_fmt.setFontWeight(75)
 
         days_any = {r.begin.date() for r in self._month_records}
@@ -494,24 +503,37 @@ class PlaybackView(QWidget):
     # so the distinction was bogus. We keep the dot color as a subtle event-
     # type accent (yellow=motion, red=alarm, green=human, blue=continuous)
     # in case the firmware ever does report a more diverse mix.
-    _EVENT_DOTS: dict[str, tuple[str, str]] = {
-        "normal": ("●", "#3b82f6"),
-        "motion": ("●", "#eab308"),
-        "alarm":  ("●", "#dc2626"),
-        "human":  ("●", "#22c55e"),
+    _EVENT_DOTS: dict[str, str] = {
+        "normal": "accent",
+        "motion": "warning",
+        "alarm": "danger_strong",
+        "human": "success",
     }
+
+    def _apply_theme(self) -> None:
+        """Re-tint everything the global QSS can't reach.
+
+        The calendar day formats and the list-item foregrounds are baked into
+        the model when the data is loaded, so they have to be recomputed —
+        a repaint alone would keep the old theme's colors.
+        """
+        self._status.setStyleSheet(f"color: {theme.token('text_muted')};")
+        if self._month_records:
+            self._highlight_days()
+        if self._day_records:
+            self._populate_day(self._day_records)
 
     def _populate_day(self, records: list[FileRecord]) -> None:
         self.file_list.clear()
         for rec in records:
             etype = getattr(rec, "event_type", "normal")
-            dot, color = self._EVENT_DOTS.get(etype, self._EVENT_DOTS["normal"])
+            token = self._EVENT_DOTS.get(etype, self._EVENT_DOTS["normal"])
             label = (
-                f"{dot}  {rec.begin:%H:%M:%S}–{rec.end:%H:%M:%S}    "
+                f"●  {rec.begin:%H:%M:%S}–{rec.end:%H:%M:%S}    "
                 f"{rec.size // 1024} KB"
             )
             item = QListWidgetItem(label)
-            item.setForeground(QColor(color))
+            item.setForeground(theme.color(token))
             item.setData(Qt.UserRole, rec)
             self.file_list.addItem(item)
         self.timeline.set_day(self.calendar.selectedDate(), records)

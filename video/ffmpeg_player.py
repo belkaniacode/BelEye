@@ -47,6 +47,14 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QColor, QImage, QPainter, QPalette, QPen
 from PySide6.QtWidgets import QWidget
 
+# The video surface is dark in BOTH the light and the dark theme, by design:
+# a light backdrop washes out the OSD overlays painted on top of the decoded
+# frame (camera name, REC pill, status dot). These mirror the VIDEO_* tokens
+# in ui/theme.py and are kept local on purpose — video/ is a leaf module and
+# must not depend on ui/. scripts/probe_theme.py asserts the two stay in sync.
+_SURFACE_BG = QColor("#0b0d10")     # == VIDEO_TOKENS["video_bg"]
+_SURFACE_TEXT = QColor("#94a3b8")   # == VIDEO_TOKENS["video_text_muted"]
+
 log = logging.getLogger(__name__)
 
 
@@ -143,10 +151,13 @@ class FFmpegPlayer(QWidget):
         # stream) for full quality. Changing it at runtime restarts ffmpeg.
         self._output_width: int = 640
 
-        # Widget chrome
+        # Widget chrome. The video surface stays dark in BOTH themes by
+        # design — a light backdrop washes out the OSD overlays painted on
+        # top of the frame. See ui/theme.py (VIDEO_TOKENS).
+        self.setObjectName("VideoSurface")
         self.setAutoFillBackground(True)
         pal = self.palette()
-        pal.setColor(QPalette.Window, QColor("#0b0d10"))
+        pal.setColor(QPalette.Window, _SURFACE_BG)
         self.setPalette(pal)
         self.setMinimumSize(160, 90)
         self.setAttribute(Qt.WA_OpaquePaintEvent, True)
@@ -591,7 +602,7 @@ class FFmpegPlayer(QWidget):
 
     def paintEvent(self, event) -> None:  # noqa: N802
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#0b0d10"))
+        painter.fillRect(self.rect(), _SURFACE_BG)
         if self._frame is not None and not self._frame.isNull():
             # "cover" — fill the whole tile, crop overflow. No black bars.
             painter.setClipRect(self.rect())
@@ -599,7 +610,7 @@ class FFmpegPlayer(QWidget):
             painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
             painter.drawImage(target, self._frame)
         else:
-            painter.setPen(QPen(QColor("#94a3b8")))
+            painter.setPen(QPen(_SURFACE_TEXT))
             painter.drawText(self.rect(), Qt.AlignCenter, self._status_msg)
 
     @staticmethod
