@@ -25,6 +25,7 @@ from app import secrets as keystore
 from app.nvr_config import nvr_keyring_user
 from .grid_view import GridView
 from .icon_util import svg_icon
+from .prefs import prefs
 from .settings_dialog import SettingsDialog
 from .theme import theme
 
@@ -143,7 +144,18 @@ class MainWindow(QMainWindow):
         spacer.setStyleSheet("background: transparent;")
         tb.addWidget(spacer)
 
-        # Theme toggle, far right.
+        # Quality policy toggle, then the theme toggle — both far right.
+        self.act_hq = QAction(self)
+        self.act_hq.setCheckable(True)
+        self.act_hq.setChecked(prefs.hq_all())
+        self.act_hq.setToolTip(
+            "Высокое качество на всех камерах.\n"
+            "Раскрытие камеры перестаёт переподключаться — картинка уже в полном "
+            "качестве. Нагружает регистратор и сеть: при 4+ каналах возможны подвисания."
+        )
+        self.act_hq.toggled.connect(prefs.set_hq_all)
+        tb.addAction(self.act_hq)
+
         self.act_theme = QAction(self)
         self.act_theme.triggered.connect(theme.toggle)
         tb.addAction(self.act_theme)
@@ -159,13 +171,15 @@ class MainWindow(QMainWindow):
         ]
 
         tb.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        # Icon-only for the toggle: its label would be the only text on that
-        # side of the bar and reads as clutter. Must come *after* the
-        # toolbar-wide style, which otherwise overwrites per-button settings.
-        toggle_btn = tb.widgetForAction(self.act_theme)
-        if toggle_btn is not None:
-            toggle_btn.setToolButtonStyle(Qt.ToolButtonIconOnly)
-            toggle_btn.setCursor(Qt.PointingHandCursor)
+        # Icon-only for the right-hand toggles: their labels would be the only
+        # text on that side of the bar and read as clutter. Must come *after*
+        # the toolbar-wide style, which otherwise overwrites per-button
+        # settings.
+        for action in (self.act_hq, self.act_theme):
+            btn = tb.widgetForAction(action)
+            if btn is not None:
+                btn.setToolButtonStyle(Qt.ToolButtonIconOnly)
+                btn.setCursor(Qt.PointingHandCursor)
 
         self._retint_toolbar()
 
@@ -178,6 +192,9 @@ class MainWindow(QMainWindow):
         """
         for action, name in getattr(self, "_toolbar_icons", ()):
             action.setIcon(svg_icon(name))
+        # Checked state is drawn by the QToolButton:checked QSS rule; the
+        # icon only needs re-tinting for the new theme.
+        self.act_hq.setIcon(svg_icon("zap", right_pad=0))
         # The toggle advertises the theme you will GET, not the one you're in.
         going_light = theme.is_dark()
         self.act_theme.setIcon(svg_icon("sun" if going_light else "moon", right_pad=0))

@@ -67,6 +67,14 @@ _ICON_SVGS: dict[str, str] = {
         '<path d="M16 21h3a2 2 0 0 0 2-2v-3"/>'
         '</svg>'
     ),
+    # "High quality everywhere" toggle. A bolt reads as "more power" at
+    # 14 px; an "HD" lettermark does not survive that size.
+    "zap": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
+        ' stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+        '<path d="M13 2 3 14h9l-1 8 10-12h-9l1-8Z"/>'
+        '</svg>'
+    ),
     # Theme toggle. The icon shows the theme you will GET, not the one
     # you are in: moon while light, sun while dark.
     "moon": (
