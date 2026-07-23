@@ -1,131 +1,143 @@
-# Использование BelEye
+# Using BelEye
 
-## Подключение видеорегистратора (NVR / DVRIP / Sofia, порт 34567)
+[Русская версия](USAGE.ru.md)
 
-Если ваши камеры подключены к китайскому видеорегистратору на прошивке
-Xiongmai — а это большинство «бюджетных» NVR, которые настраиваются по
-порту 34567, — достаточно ввести **один** адрес: приложение само найдёт
-все подключённые камеры и подтянет статус записи.
-Как определить свою модель — см. [совместимость](COMPATIBILITY.ru.md).
+## Connecting a recorder (NVR / DVRIP / Sofia, port 34567)
 
-1. ⚙ **Настройки** → **«Добавить NVR»**
-2. Заполните форму:
-   - **Название** — произвольное (например, «Дом», «Объект»)
-   - **Хост / IP** — например, `192.168.0.60`
-   - **Порт** — `34567` (стандартный DVRIP)
-   - **Логин / Пароль** — учётные данные регистратора
-3. **Проверить соединение** — выполняется логин, читается состояние
-   цифровых каналов. Через 1–2 секунды появляется «Найдено каналов: N»
-   с реальными именами камер.
-4. **Сохранить.** В сетке появятся плитки только для **реально
-   подключённых** каналов (пустые порты `D05`/`D06`/… не показываются).
+If your cameras are wired into a Chinese recorder running Xiongmai firmware — which is most of the
+budget NVRs configured over port 34567 — you only need **one** address. BelEye finds every
+connected camera by itself and picks up the recording status.
+To identify your model, see [compatibility](COMPATIBILITY.md).
 
-При следующем запуске BelEye сам опросит регистратор и обновит список,
-если вы добавили/убрали камеру — никаких ручных действий.
+1. ⚙ **Настройки** → **Добавить NVR**
+2. Fill in the form:
+   - **Name** — anything you like ("Home", "Warehouse")
+   - **Host / IP** — e.g. `192.168.0.60`
+   - **Port** — `34567` (the DVRIP default)
+   - **User / Password** — the recorder's credentials
+3. **Проверить соединение** — logs in and reads the digital channel status. After a second or two
+   you get "Найдено каналов: N" with the real camera names.
+4. **Save.** The grid shows tiles only for ports that **actually have a camera** — empty ports
+   (`D05`, `D06`, …) are hidden.
 
-### Индикатор записи
+On the next launch BelEye polls the recorder again and refreshes the list if you added or removed
+a camera. Nothing to do by hand.
 
-На плитке канала, на котором сейчас идёт запись, отображается красный
-бейдж **● REC** в левом верхнем углу. Сигнал берётся из расписания
-записи регистратора (`Record` config) и обновляется каждые 30 секунд.
+### Recording indicator
 
-### Просмотр архива записей
+A channel that is being recorded right now shows a red **● REC** badge in the top-left corner of
+its tile. The signal comes from the recorder's own record schedule (`Record` config) and refreshes
+every 30 seconds.
 
-1. **Правый клик** по плитке NVR-канала → **«Архив…»**
-2. Откроется окно:
-   - **Слева сверху — календарь.** Дни с записями подсвечены цветом.
-   - **Слева снизу — список фрагментов** за выбранный день
-     (время начала–конца + размер).
-   - **Справа — плеер.** Двойной клик по фрагменту (или клик по
-     таймлайну) → начинается воспроизведение прямо из NVR (поток HEVC
-     / H.264, декодирование через FFmpeg).
-   - **Снизу — таймлайн 00:00–24:00.** Закрашенные блоки — записи,
-     красная вертикальная линия — текущая позиция. Клик по таймлайну
-     = перейти на эту секунду.
-3. **Транспортные кнопки:** ▶ воспроизвести / ■ стоп / `1×`/`2×`/`4×`
-   (скорость, если поддерживается прошивкой).
-4. **Шорткаты:** `Пробел` — пуск/пауза, `Esc` — закрыть окно.
+### Archive playback
 
-### Экспорт фрагмента в mp4
+1. **Right-click** an NVR channel tile → **Архив…**
+2. The window has four parts:
+   - **Calendar, top left.** Days that contain recordings are highlighted; days with
+     event-triggered recordings get a different colour.
+   - **File list, bottom left** — the fragments for the selected day (start–end time and size).
+   - **Player, right.** Double-click a fragment, or click the timeline, and playback starts
+     straight from the recorder (HEVC or H.264, decoded through FFmpeg).
+   - **Timeline, bottom** — 00:00 to 24:00. Filled blocks are recordings, the red vertical line is
+     the playback position. Click anywhere to seek to that second.
+3. **Transport controls:** ▶ play / ⏸ pause / ■ stop, and a speed button cycling
+   ¼× → ½× → 1× → 2× → 4× → 8×.
+4. **Shortcuts:** `Space` play/pause, `Esc` close.
 
-В окне архива выберите фрагмент → **«Экспорт…»** → укажите путь.
-Видео сохраняется **без перекодирования** (`-c copy`), CPU не нагружается,
-качество идентично оригиналу.
+Navigating to a month with no recordings makes BelEye walk back automatically until it finds one
+(up to six months), so an empty calendar usually means the recordings really have rotated out.
 
-## Добавление одиночной IP-камеры (RTSP)
+### Exporting a fragment to mp4
 
-1. Нажмите **⚙ Настройки** на панели инструментов
-2. **Добавить камеру** → заполните форму:
-   - **Название** — произвольное (например, "Подъезд")
-   - **Хост / IP** — например, `192.168.0.63`
-   - **Порт** — обычно `554` (RTSP по умолчанию)
-   - **Логин / Пароль** — учётные данные камеры
-   - **Путь** — зависит от производителя (см. ниже)
-   - **Транспорт** — `tcp` рекомендуется (надёжнее), `udp` — ниже задержка
-3. **Проверить соединение** — `ffprobe` попробует подключиться (до 6 сек)
-4. **OK** — камера сохранится и сразу появится в сетке
+In the archive window select a fragment → **Экспорт…** → choose a path. The video is saved
+**without re-encoding** (`-c copy`): no CPU load, and the quality is bit-identical to the original.
 
-## Горячие клавиши
+## Adding a single IP camera (RTSP)
 
-| Клавиша | Действие |
-|--------|----------|
-| `F11` | Полный экран |
-| `Esc` | Выход из полного экрана / возврат к сетке |
-| `Ctrl+G` | Переключить сетка ↔ одиночный режим |
-| Двойной клик по камере | Развернуть на весь экран |
-| Правый клик по камере | Меню: Изменить / Переподключить / Удалить |
+1. Click **⚙ Настройки** in the toolbar
+2. **Добавить камеру** → fill in:
+   - **Name** — anything ("Front door")
+   - **Host / IP** — e.g. `192.168.0.63`
+   - **Port** — usually `554`
+   - **User / Password** — the camera's credentials
+   - **Path** — vendor-specific, see the table below
+   - **Transport** — `tcp` is recommended; `udp` only if your camera has trouble with TCP
+3. **Проверить соединение** — FFmpeg tries to pull two seconds of real video, over the same
+   transport playback will use
+4. **Save** — the camera appears in the grid immediately
 
-## RTSP-пути по производителям
+## Shortcuts
 
-| Производитель | Пример пути |
-|---------------|------------|
-| Hikvision | `/Streaming/Channels/101` (main), `/Streaming/Channels/102` (sub) |
+| Key | Action |
+|-----|--------|
+| `F11` | Fullscreen |
+| `Esc` | Exit fullscreen / back to the grid |
+| `Ctrl+G` | Toggle grid ↔ single camera |
+| Double-click a tile | Expand that camera |
+| Right-click a tile | Edit / Reconnect / Archive / Remove |
+
+## RTSP paths by vendor
+
+| Vendor | Example path |
+|--------|--------------|
+| Xiongmai / DVRIP | `/user=admin&password=PASS&channel=1&stream=0.sdp` (`stream=1` = sub) |
+| Hikvision | `/Streaming/Channels/101` (main), `/102` (sub) |
 | Dahua | `/cam/realmonitor?channel=1&subtype=0` |
 | Reolink | `/h264Preview_01_main`, `/h264Preview_01_sub` |
 | TP-Link Tapo | `/stream1` (HD), `/stream2` (SD) |
-| Xiaomi (с хаком) | `/unicast` |
+| Uniview | `/media/video1` |
 | ONVIF generic | `/onvif1`, `/live/main`, `/live.sdp` |
 
-Если путь неизвестен — проверьте веб-интерфейс камеры или документацию ONVIF.
+If you do not know the path, check the camera's web interface or its manual.
 
-## Тест в терминале
+## Testing from the terminal
 
-Пример из задачи:
 ```bash
-ffplay -an -rtsp_transport tcp rtsp://admin:password@192.168.0.63:554
+ffmpeg -rtsp_transport tcp -i "rtsp://admin:password@192.168.0.63:554/path" -t 3 -f null -
 ```
 
-Если это работает в терминале — должно работать и в BelEye. Введите те же параметры в форму добавления камеры.
+If that works in a terminal it will work in BelEye — put the same values into the camera form.
 
 ## Troubleshooting
 
-### Чёрный экран / "exit code"
-- Проверьте, что `ffplay` доступен в терминале (`which ffplay`)
-- Попробуйте URL вручную: `ffplay -an -rtsp_transport tcp rtsp://USER:PASS@HOST:PORT/PATH`
-- Проверьте firewall и сеть до камеры (`ping`, `nc -zv HOST 554`)
-- Попробуйте сменить транспорт `tcp` ↔ `udp`
+### Black tile, or an error message on it
 
-### Высокая задержка
-- Используйте `tcp` транспорт (стабильнее по WiFi)
-- Используйте sub-stream камеры (меньшее разрешение → меньше задержка)
+- Confirm FFmpeg is installed: `which ffmpeg`
+- Try the URL by hand with the command above — the error it prints is usually the whole story
+- Check the network path to the camera: `ping <host>`, `nc -zv <host> 554`
+- Try switching transport `tcp` ↔ `udp`
 
-### Пароли не сохраняются
-- На Linux установите GNOME Keyring или KWallet:
-  ```bash
-  sudo pacman -S gnome-keyring   # Arch
-  sudo apt install gnome-keyring # Debian
-  ```
-- Запустите `python -c "import keyring; print(keyring.get_keyring())"` для диагностики
+### The recorder connects but no channels are found
 
-### Видео не встраивается в окно (показывается отдельным окном)
-- На Linux используется `SDL_WINDOWID` — работает только с X11.
-  Под Wayland запустите приложение в XWayland-режиме:
-  ```bash
-  QT_QPA_PLATFORM=xcb python main.py
-  ```
+Run with `BELEYE_LOG_LEVEL=DEBUG` and look for `[NVR] discovery`. BelEye tries six firmware
+dialects; if yours needs a seventh, that log line is exactly what an issue report needs.
 
-## Файлы
+### High latency
 
-- `~/.config/beleye/cameras.json` — список камер (без паролей)
-- `~/.local/state/beleye/beleye.log` (или `~/.config/beleye/beleye.log`) — лог
-- Системный keyring — пароли
+- Keep the transport on `tcp` — it is more stable over Wi-Fi
+- Use the camera's sub stream (lower resolution → lower latency)
+- For recorders, leave the quality switch off so the grid uses sub streams
+
+### Passwords are not saved
+
+On Linux install a keyring service:
+
+```bash
+sudo pacman -S gnome-keyring    # Arch
+sudo apt install gnome-keyring  # Debian/Ubuntu
+```
+
+Diagnose with `python -c "import keyring; print(keyring.get_keyring())"`.
+
+### Video does not render correctly under Wayland
+
+```bash
+QT_QPA_PLATFORM=xcb python main.py
+```
+
+## Files
+
+- `~/.config/beleye/cameras.json` — RTSP cameras (no passwords)
+- `~/.config/beleye/nvrs.json` — recorders and their channels (no passwords)
+- `~/.local/state/beleye/beleye.log` — log
+- System keyring — passwords

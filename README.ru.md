@@ -11,7 +11,7 @@
 
 Linux · Windows · macOS — бесплатно и с открытым кодом (MIT)
 
-[Совместимость](docs/COMPATIBILITY.ru.md) · [Использование](docs/USAGE.md) · [Архитектура](docs/ARCHITECTURE.md) · [English](README.md)
+[Совместимость](docs/COMPATIBILITY.ru.md) · [Использование](docs/USAGE.ru.md) · [Архитектура](docs/ARCHITECTURE.ru.md) · [English](README.md)
 
 </div>
 
@@ -166,7 +166,7 @@ BelEye перебирает шесть диалектов прошивок; ес
 ## На чём сделано
 
 Python 3.11+ · PySide6 (Qt 6) · FFmpeg · собственная реализация протокола DVRIP/Sofia.
-Подробности — [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+Подробности — [docs/ARCHITECTURE.md](docs/ARCHITECTURE.ru.md).
 
 ## Настройки и данные
 
