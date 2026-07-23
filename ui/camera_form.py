@@ -32,13 +32,15 @@ class _ProbeWorker(QObject):
 
     done = Signal(bool, str)
 
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str, transport: str = "tcp") -> None:
         super().__init__()
         self._url = url
+        self._transport = transport
 
     def run(self) -> None:
         try:
-            ok, info = probe_rtsp(self._url, timeout_s=8.0)
+            ok, info = probe_rtsp(self._url, timeout_s=8.0,
+                                  transport=self._transport)
         except Exception as exc:
             ok, info = False, f"внутренняя ошибка: {exc}"
         self.done.emit(ok, info)
@@ -164,12 +166,14 @@ class CameraForm(QDialog):
             self._set_status("Укажите хост.", "danger")
             return
         url = build_rtsp_url(cam, pwd)
-        self._set_status("Проверка...", "text_muted")
+        # Probe over the transport the user picked — otherwise a green test
+        # would say nothing about how playback will actually behave.
+        self._set_status(f"Проверка ({cam.transport.upper()})...", "text_muted")
         self.test_btn.setEnabled(False)
 
         # [FIX] Run probe in a QThread so the GUI keeps responding
         self._probe_thread = QThread(self)
-        self._probe_worker = _ProbeWorker(url)
+        self._probe_worker = _ProbeWorker(url, cam.transport)
         self._probe_worker.moveToThread(self._probe_thread)
         self._probe_thread.started.connect(self._probe_worker.run)
         self._probe_worker.done.connect(self._on_probe_done)

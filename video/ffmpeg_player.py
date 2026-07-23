@@ -66,6 +66,24 @@ def find_ffmpeg() -> Optional[str]:
     return shutil.which("ffmpeg")
 
 
+VALID_TRANSPORTS = ("tcp", "udp")
+
+
+def normalize_transport(transport: str | None) -> str:
+    """Coerce a stored transport value to one ffmpeg accepts.
+
+    TCP is the safe default: it survives NAT and lossy Wi-Fi where UDP RTP
+    silently drops packets. UDP is offered because some cameras have buggy
+    TCP interleaving, and on a clean LAN it has lower latency.
+    """
+    value = (transport or "").strip().lower()
+    if value in VALID_TRANSPORTS:
+        return value
+    if value:
+        log.warning("[FIX transport] unknown transport %r, falling back to tcp", transport)
+    return "tcp"
+
+
 def _shiboken_valid(obj) -> bool:
     """[FIX shiboken] True if the underlying C++ object is still alive."""
     try:
@@ -118,11 +136,13 @@ class FFmpegPlayer(QWidget):
         *,
         input_mode: str = "rtsp",
         input_codec: str = "h264",
+        transport: str = "tcp",
     ) -> None:
         super().__init__(parent)
         self._url = url
         self._input_mode = input_mode  # "rtsp" or "pipe"
         self._input_codec = input_codec  # for pipe mode: "h264" | "hevc"
+        self._transport = normalize_transport(transport)
 
         self._stopped = True
         self._backoff_idx = 0
@@ -141,6 +161,7 @@ class FFmpegPlayer(QWidget):
         self._stdout_off: int = 0
         self._stderr_tail: list[str] = []
         self._in_output_section: bool = False
+        self._stderr_partial: str = ""
         self._width: int = 0
         self._height: int = 0
         self._frame_size: int = 0
@@ -194,6 +215,17 @@ class FFmpegPlayer(QWidget):
     def set_input_codec(self, codec: str) -> None:
         """Set 'h264' or 'hevc' for pipe mode. Must be called before start()."""
         self._input_codec = codec
+
+    def set_transport(self, transport: str) -> None:
+        """Change the RTSP transport. Restarts the decoder if it is running,
+        since the transport is chosen at connection time."""
+        transport = normalize_transport(transport)
+        if transport == self._transport:
+            return
+        self._transport = transport
+        if self.is_running():
+            self._kill_process()
+            self._start_process()
 
     def set_output_width(self, width: int) -> None:
         """[FIX quality] Change the scale-filter width cap. If the decoder is
@@ -287,13 +319,18 @@ class FFmpegPlayer(QWidget):
         # resolution change restarts ffmpeg, and "did the decoder restart?"
         # is otherwise only inferable from the log.
         self.process_starts += 1
-        log.info("[FIX] Spawning ffmpeg for %s", self._safe_url())
+        if self._input_mode == "rtsp":
+            log.info("[FIX] Spawning ffmpeg for %s (rtsp transport=%s)",
+                     self._safe_url(), self._transport)
+        else:
+            log.info("[FIX] Spawning ffmpeg for %s", self._safe_url())
 
         # Reset per-attempt state
         self._stdout_buf = bytearray()
         self._stdout_off = 0
         self._stderr_tail = []
         self._in_output_section = False
+        self._stderr_partial = ""
         self._width = 0
         self._height = 0
         self._frame_size = 0
@@ -345,7 +382,7 @@ class FFmpegPlayer(QWidget):
             args = [
                 "-hide_banner",
                 "-loglevel", "info",
-                "-rtsp_transport", "tcp",
+                "-rtsp_transport", self._transport,
                 "-timeout", "5000000",
                 "-fflags", "nobuffer",
                 "-flags", "low_delay",
@@ -410,8 +447,21 @@ class FFmpegPlayer(QWidget):
         data = bytes(self._proc.readAllStandardError())
         if not data:
             return
-        text = data.decode("utf-8", errors="replace")
-        for line in text.splitlines():
+        # [FIX stderr-split] A read can end mid-line. Splitting the raw chunk
+        # would hand the parser fragments like ", 25 fps, 20 tbr" and hide the
+        # "Output #0" marker or the "Stream ... 800x448" line it needs, so the
+        # dimensions were never found and the stream died on the ready timeout.
+        # Keep the trailing partial line and prepend it to the next chunk.
+        text = self._stderr_partial + data.decode("utf-8", errors="replace")
+        # ffmpeg's progress lines end in \r, not \n — treat both as breaks but
+        # only carry over a tail that ended in neither.
+        if text and text[-1] not in ("\n", "\r"):
+            lines = text.splitlines()
+            self._stderr_partial = lines.pop() if lines else ""
+        else:
+            lines = text.splitlines()
+            self._stderr_partial = ""
+        for line in lines:
             line = line.rstrip()
             if not line:
                 continue

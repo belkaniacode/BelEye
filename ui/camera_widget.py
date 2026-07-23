@@ -394,7 +394,7 @@ class CameraTile(DraggableTileMixin, QFrame):
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         url = build_rtsp_url(camera, get_password(camera.id))
-        self.player = FFmpegPlayer(url, self)
+        self.player = FFmpegPlayer(url, self, transport=camera.transport)
         self.player.streamUp.connect(lambda: self._overlay.set_status("live"))
         self.player.streamDown.connect(lambda _r: self._overlay.set_status("down"))
 
@@ -435,6 +435,9 @@ class CameraTile(DraggableTileMixin, QFrame):
         was_running = self.player.is_running() or not self.player._stopped
         self.player.stop()
         self.player.set_url(url)
+        # The transport can change in the same edit as the URL, and it is
+        # applied at connection time — set it while the player is stopped.
+        self.player.set_transport(self.camera.transport)
         self._overlay.set_status("connecting")
         if was_running:
             self.player.start()

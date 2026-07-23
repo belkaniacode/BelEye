@@ -14,22 +14,28 @@ import logging
 import re
 import subprocess
 
-from .ffmpeg_player import find_ffmpeg
+from .ffmpeg_player import find_ffmpeg, normalize_transport
 
 log = logging.getLogger(__name__)
 
 _RE_VIDEO = re.compile(r"Stream #\d+:\d+.*?Video:\s*([^,]+).*?(\d{2,5}x\d{2,5})", re.IGNORECASE)
 
 
-def probe_rtsp(url: str, timeout_s: float = 8.0) -> tuple[bool, str]:
+def probe_rtsp(url: str, timeout_s: float = 8.0,
+               transport: str = "tcp") -> tuple[bool, str]:
+    """Probe an RTSP URL. ``transport`` must match what the player will use —
+    a test that passes over TCP while playback runs over UDP is worse than
+    no test at all."""
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
         return False, "ffmpeg not installed"
+    transport = normalize_transport(transport)
+    log.info("[FIX transport] probing %s over %s", url.split("@")[-1], transport)
     args = [
         ffmpeg,
         "-hide_banner",
         "-loglevel", "info",
-        "-rtsp_transport", "tcp",
+        "-rtsp_transport", transport,
         "-timeout", "5000000",
         "-t", "2",
         "-i", url,
