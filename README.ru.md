@@ -11,7 +11,7 @@
 
 Linux · Windows · macOS — бесплатно и с открытым кодом (MIT)
 
-[Совместимость](docs/COMPATIBILITY.md) · [Использование](docs/USAGE.md) · [Архитектура](docs/ARCHITECTURE.md) · [English](README.md)
+[Совместимость](docs/COMPATIBILITY.ru.md) · [Использование](docs/USAGE.md) · [Архитектура](docs/ARCHITECTURE.md) · [English](README.md)
 
 </div>
 
@@ -55,7 +55,7 @@ BelEye. Hangzhou Xiongmai — это OEM-производитель, поста�
 
 Проверено на железе: **Xiongmai NBD80S16S-KL**, 8-канальный PoE HVR, прошивка `V4.03.R11`, H.265,
 с детекцией лиц, людей и автомобилей — продаётся под десятками разных названий.
-Подробности и честные оговорки: **[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)**.
+Подробности и честные оговорки: **[docs/COMPATIBILITY.ru.md](docs/COMPATIBILITY.ru.md)**.
 
 ## Скриншот
 
@@ -129,7 +129,7 @@ python main.py
 **⚙ Настройки → Добавить камеру** → хост, порт `554`, учётные данные и **путь потока**, который у
 каждого производителя свой (`/Streaming/Channels/101` у Hikvision,
 `/cam/realmonitor?channel=1&subtype=0` у Dahua и так далее — см.
-[шпаргалку](docs/COMPATIBILITY.md#ip-cameras-without-a-recorder)).
+[шпаргалку](docs/COMPATIBILITY.ru.md#ip-камеры-без-регистратора)).
 Транспорт оставьте на `tcp`, если нет причин поступить иначе.
 
 Автопоиска по ONVIF пока нет, поэтому путь придётся вписать вручную.

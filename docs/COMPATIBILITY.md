@@ -6,6 +6,8 @@ cameras.** If you only have standalone IP cameras, BelEye works with any of them
 This page is deliberately specific about what is *verified*, what is *likely*, and what does
 *not* work. Over-promising here would only waste your evening.
 
+[Русская версия](COMPATIBILITY.ru.md)
+
 ---
 
 ## Check your device in 60 seconds
